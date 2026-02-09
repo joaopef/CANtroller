@@ -11,6 +11,9 @@
 - 🔍 **Real-time CAN Monitoring** - View all CAN messages with ID, data, cycle time, and count
 - 📧 **Periodic Message Transmission** - Send messages at configurable intervals
 - 🔄 **Intelligent Auto-Response** - Automatically respond to specific CAN IDs with custom data
+- 📊 **Signal Decoding** - Decode CAN data into readable values (Speed:20km/h, Voltage:100V)
+- 📥 **CSV Import** - Import CAN IDs and signal definitions from CSV files
+- 🔢 **3-Mode Data Display** - Toggle between HEX, Decimal, and Decoded views
 - 🎨 **Modern Dark Theme** - Professional and eye-friendly interface
 - 💾 **Save/Load Configuration** - Persist your messages and rules in `.cantroller` files
 - 🔎 **Message Filtering** - Quick filter by CAN ID
@@ -68,6 +71,27 @@ For Windows users, download the pre-built executable from the [Releases](https:/
 - **Ctrl+S** - Save current configuration
 - **Ctrl+O** - Open a saved configuration
 - **Ctrl+N** - New configuration (clear all)
+
+### Signal Decoding (v1.2)
+
+1. Go to **File → Import → Import CAN Blocks** and select your CSV file
+2. Go to **File → Import → Import Signal Definitions** and select your data points CSV
+3. Click on the **Data** column header to cycle through: HEX → Decimal → Decoded
+4. In Decoded mode, signals display as `Speed:20km/h Voltage:100V`
+
+**CSV Formats:**
+
+*CAN Blocks.csv:*
+```csv
+CAN bus Nr,Name,CAN ID [hex],Ext,Send period max [ms],...
+CAN_BUS_0,GET_SOC_1,0x18F81280,1,0,...
+```
+
+*CAN Data Points.csv:*
+```csv
+CAN ID,CAN Data Point,Signal name,Bit start,Bit length,Factor,Unit
+0x18F86890,SPEED,Current speed,0,8,1,km/h
+```
 
 ## 🏗️ Architecture
 
