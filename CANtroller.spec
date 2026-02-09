@@ -1,16 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
-
-hiddenimports = ['can.interfaces.pcan', 'can.interfaces', 'can.interfaces.virtual']
-hiddenimports += collect_submodules('can')
 
 
 a = Analysis(
-    ['main.py'],
+    ['src\\main.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=hiddenimports,
+    hiddenimports=[
+        'can.interfaces.pcan',
+        'can.interfaces.virtual',
+        'can.interfaces.socketcan',
+        'can.interfaces.kvaser',
+        'can.interfaces.vector',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

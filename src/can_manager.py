@@ -194,6 +194,11 @@ class CANManager(QObject):
         """Clear all response rules"""
         self._response_rules.clear()
     
+    def update_response_rule(self, index: int, rule: ResponseRule):
+        """Update a response rule at the given index"""
+        if 0 <= index < len(self._response_rules):
+            self._response_rules[index] = rule
+    
     # === Transmit Messages (Periodic) ===
     
     def add_transmit_message(self, msg: TransmitMessage):
