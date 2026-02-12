@@ -1,4 +1,4 @@
-"""
+﻿"""
 Main Window - CANtroller application interface
 """
 import time
@@ -14,13 +14,15 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QToolBar, QStatusBar, QLabel,
     QComboBox, QPushButton, QGroupBox, QHeaderView, QMessageBox,
     QDialog, QFormLayout, QLineEdit, QCheckBox, QSpinBox, QDialogButtonBox,
-    QMenu, QMenuBar, QTabWidget, QFrame, QFileDialog, QApplication
+    QMenu, QMenuBar, QTabWidget, QFrame, QFileDialog, QApplication,
+    QProgressBar, QSlider, QGridLayout
 )
 from PyQt6.QtCore import Qt, QTimer, QMimeData
 from PyQt6.QtGui import QAction, QIcon, QColor, QFont, QDragEnterEvent, QDropEvent
 import can
 
 from can_manager import CANManager, ResponseRule, TransmitMessage
+from simulator import SimulationEngine, TripProfileGenerator
 
 # Settings file path - use app directory for PyInstaller compatibility
 def get_settings_path():
@@ -145,6 +147,14 @@ class AddRuleDialog(QDialog):
         self.comment_edit.setPlaceholderText("e.g., BMS_Response")
         layout.addRow("Comment:", self.comment_edit)
         
+        # Increment Byte (auto-counter)
+        self.increment_combo = QComboBox()
+        self.increment_combo.addItem("None", -1)
+        for i in range(8):
+            self.increment_combo.addItem(f"Byte {i}", i)
+        self.increment_combo.setToolTip("Auto-increment the selected byte\non each response (wraps 255→0)")
+        layout.addRow("Increment Byte:", self.increment_combo)
+        
         # Buttons
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -161,6 +171,10 @@ class AddRuleDialog(QDialog):
             self.extended_check.setChecked(rule.is_extended)
             self.delay_spin.setValue(rule.delay_ms)
             self.comment_edit.setText(rule.comment)
+            # Set increment byte if configured
+            idx = self.increment_combo.findData(rule.increment_byte)
+            if idx >= 0:
+                self.increment_combo.setCurrentIndex(idx)
     
     def _validate_and_accept(self):
         """Validate inputs before accepting"""
@@ -199,7 +213,8 @@ class AddRuleDialog(QDialog):
                 response_data=data_bytes,
                 is_extended=self.extended_check.isChecked(),
                 delay_ms=self.delay_spin.value(),
-                comment=self.comment_edit.text().strip()
+                comment=self.comment_edit.text().strip(),
+                increment_byte=self.increment_combo.currentData()
             )
         except ValueError as e:
             QMessageBox.warning(self, "Invalid Input", str(e))
@@ -292,6 +307,17 @@ class NewTransmitMessageDialog(QDialog):
         type_layout.addWidget(self.remote_check)
         middle_layout.addWidget(type_group)
         
+        # Increment Byte (auto-counter)
+        inc_group = QGroupBox("Auto-Increment")
+        inc_layout = QVBoxLayout(inc_group)
+        self.increment_combo = QComboBox()
+        self.increment_combo.addItem("None", -1)
+        for i in range(8):
+            self.increment_combo.addItem(f"Byte {i}", i)
+        self.increment_combo.setToolTip("Auto-increment the selected byte\non each send cycle (wraps 255→0)")
+        inc_layout.addWidget(self.increment_combo)
+        middle_layout.addWidget(inc_group)
+        
         middle_layout.addStretch()
         layout.addLayout(middle_layout)
         
@@ -321,6 +347,10 @@ class NewTransmitMessageDialog(QDialog):
             self.paused_check.setChecked(msg.is_paused)
             self.extended_check.setChecked(msg.is_extended)
             self.comment_edit.setText(msg.comment)
+            # Set increment byte if configured
+            idx = self.increment_combo.findData(msg.increment_byte)
+            if idx >= 0:
+                self.increment_combo.setCurrentIndex(idx)
     
     def _update_data_fields(self, length: int):
         """Enable/disable data fields based on length"""
@@ -359,7 +389,8 @@ class NewTransmitMessageDialog(QDialog):
                 is_extended=self.extended_check.isChecked(),
                 cycle_time_ms=self.cycle_time_spin.value(),
                 is_paused=self.paused_check.isChecked(),
-                comment=self.comment_edit.text().strip()
+                comment=self.comment_edit.text().strip(),
+                increment_byte=self.increment_combo.currentData()
             )
         except ValueError as e:
             QMessageBox.warning(self, "Invalid Input", f"Invalid hex value: {e}")
@@ -434,6 +465,14 @@ class MainWindow(QMainWindow):
         # Load settings and auto-open last file
         self._load_settings()
         self._update_window_title()
+        
+        # Simulation engine (completely separate from transmit messages)
+        self.sim_engine = SimulationEngine(self.can_manager)
+        self.sim_engine.progress_changed.connect(self._on_sim_progress)
+        self.sim_engine.data_updated.connect(self._on_sim_data_updated)
+        self.sim_engine.simulation_finished.connect(self._on_sim_finished)
+        self.sim_engine.simulation_started.connect(self._on_sim_started)
+        self.sim_engine.status_message.connect(self._on_sim_status)
     
     def _setup_ui(self):
         """Setup the main UI layout"""
@@ -610,6 +649,108 @@ class MainWindow(QMainWindow):
         
         self.transmit_tabs.addTab(rules_widget, "🔄 Response Rules")
         
+        # --- Tab 3: Simulation ---
+        sim_widget = QWidget()
+        sim_layout = QVBoxLayout(sim_widget)
+        sim_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Top controls row
+        sim_controls = QHBoxLayout()
+        
+        # Profile selector
+        sim_controls.addWidget(QLabel("Profile:"))
+        self.sim_profile_combo = QComboBox()
+        self.sim_profile_combo.setMinimumWidth(200)
+        self._available_profiles = TripProfileGenerator.get_available_profiles()
+        for p in self._available_profiles:
+            self.sim_profile_combo.addItem(p['name'])
+        sim_controls.addWidget(self.sim_profile_combo)
+        
+        sim_controls.addWidget(QLabel("  Speed:"))
+        self.sim_speed_combo = QComboBox()
+        self.sim_speed_combo.addItems(["1x", "2x", "5x", "10x", "20x", "50x"])
+        self.sim_speed_combo.setCurrentIndex(0)
+        self.sim_speed_combo.currentTextChanged.connect(self._on_sim_speed_changed)
+        sim_controls.addWidget(self.sim_speed_combo)
+        
+        self.sim_import_btn = QPushButton("📂 Import CSV...")
+        self.sim_import_btn.clicked.connect(self._sim_import_csv)
+        sim_controls.addWidget(self.sim_import_btn)
+        
+        sim_controls.addStretch()
+        
+        # Start / Pause / Stop buttons
+        self.sim_start_btn = QPushButton("▶ Start")
+        self.sim_start_btn.clicked.connect(self._sim_start)
+        self.sim_start_btn.setStyleSheet("QPushButton { background-color: #4CAF50; padding: 6px 18px; font-weight: bold; } QPushButton:hover { background-color: #66BB6A; }")
+        sim_controls.addWidget(self.sim_start_btn)
+        
+        self.sim_pause_btn = QPushButton("⏸ Pause")
+        self.sim_pause_btn.clicked.connect(self._sim_pause)
+        self.sim_pause_btn.setEnabled(False)
+        sim_controls.addWidget(self.sim_pause_btn)
+        
+        self.sim_stop_btn = QPushButton("⏹ Stop")
+        self.sim_stop_btn.clicked.connect(self._sim_stop)
+        self.sim_stop_btn.setEnabled(False)
+        self.sim_stop_btn.setStyleSheet("QPushButton { background-color: #f44336; padding: 6px 18px; } QPushButton:hover { background-color: #ef5350; }")
+        sim_controls.addWidget(self.sim_stop_btn)
+        
+        sim_layout.addLayout(sim_controls)
+        
+        # Progress bar
+        self.sim_progress = QProgressBar()
+        self.sim_progress.setRange(0, 100)
+        self.sim_progress.setValue(0)
+        self.sim_progress.setTextVisible(True)
+        self.sim_progress.setFormat("Ready")
+        self.sim_progress.setStyleSheet("""
+            QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; background-color: #1e1e1e; color: #e0e0e0; height: 20px; }
+            QProgressBar::chunk { background-color: #4CAF50; border-radius: 2px; }
+        """)
+        sim_layout.addWidget(self.sim_progress)
+        
+        # Live data display
+        live_data_group = QGroupBox("Live Simulation Data")
+        live_grid = QGridLayout(live_data_group)
+        live_grid.setContentsMargins(10, 10, 10, 5)
+        
+        # Row 0: BMS data
+        live_grid.addWidget(QLabel("🔋 Voltage:"), 0, 0)
+        self.sim_voltage_label = QLabel("---")
+        self.sim_voltage_label.setStyleSheet("color: #4fc3f7; font-weight: bold; font-size: 13px;")
+        live_grid.addWidget(self.sim_voltage_label, 0, 1)
+        
+        live_grid.addWidget(QLabel("⚡ Current:"), 0, 2)
+        self.sim_current_label = QLabel("---")
+        self.sim_current_label.setStyleSheet("color: #ffb74d; font-weight: bold; font-size: 13px;")
+        live_grid.addWidget(self.sim_current_label, 0, 3)
+        
+        live_grid.addWidget(QLabel("🔋 SOC:"), 0, 4)
+        self.sim_soc_label = QLabel("---")
+        self.sim_soc_label.setStyleSheet("color: #81c784; font-weight: bold; font-size: 13px;")
+        live_grid.addWidget(self.sim_soc_label, 0, 5)
+        
+        # Row 1: MCU data
+        live_grid.addWidget(QLabel("🏎️ Speed:"), 1, 0)
+        self.sim_speed_label = QLabel("---")
+        self.sim_speed_label.setStyleSheet("color: #ce93d8; font-weight: bold; font-size: 13px;")
+        live_grid.addWidget(self.sim_speed_label, 1, 1)
+        
+        live_grid.addWidget(QLabel("📏 Trip:"), 1, 2)
+        self.sim_mileage_label = QLabel("---")
+        self.sim_mileage_label.setStyleSheet("color: #a5d6a7; font-weight: bold; font-size: 13px;")
+        live_grid.addWidget(self.sim_mileage_label, 1, 3)
+        
+        live_grid.addWidget(QLabel("⚙️ Gear:"), 1, 4)
+        self.sim_gear_label = QLabel("---")
+        self.sim_gear_label.setStyleSheet("color: #90caf9; font-weight: bold; font-size: 13px;")
+        live_grid.addWidget(self.sim_gear_label, 1, 5)
+        
+        sim_layout.addWidget(live_data_group)
+        
+        self.transmit_tabs.addTab(sim_widget, "🔄 Simulation")
+        
         transmit_layout.addWidget(self.transmit_tabs)
         splitter.addWidget(transmit_group)
         
@@ -697,6 +838,21 @@ class MainWindow(QMainWindow):
         new_msg_action.setShortcut("Ins")
         new_msg_action.triggered.connect(self._new_transmit_message)
         transmit_menu.addAction(new_msg_action)
+        
+        # Simulation menu
+        sim_menu = menubar.addMenu("&Simulation")
+        
+        sim_start_action = QAction("▶ &Start Simulation", self)
+        sim_start_action.triggered.connect(self._sim_start)
+        sim_menu.addAction(sim_start_action)
+        
+        sim_pause_action = QAction("⏸ &Pause Simulation", self)
+        sim_pause_action.triggered.connect(self._sim_pause)
+        sim_menu.addAction(sim_pause_action)
+        
+        sim_stop_action = QAction("⏹ S&top Simulation", self)
+        sim_stop_action.triggered.connect(self._sim_stop)
+        sim_menu.addAction(sim_stop_action)
         
         # View menu
         view_menu = menubar.addMenu("&View")
@@ -1308,6 +1464,7 @@ class MainWindow(QMainWindow):
                         data=msg_data['data'],
                         is_extended=msg_data.get('is_extended', True),
                         cycle_time_ms=msg_data.get('cycle_time_ms', 100),
+                    increment_byte=msg_data.get('increment_byte', -1),
                         is_paused=msg_data.get('is_paused', False),
                         comment=msg_data.get('comment', '')
                     )
@@ -1319,6 +1476,7 @@ class MainWindow(QMainWindow):
                         trigger_id=rule_data['trigger_id'],
                         response_id=rule_data['response_id'],
                         response_data=rule_data['response_data'],
+                    increment_byte=rule_data.get('increment_byte', -1),
                         is_extended=rule_data.get('is_extended', True),
                         delay_ms=rule_data.get('delay_ms', 0),
                         comment=rule_data.get('comment', ''),
@@ -1391,6 +1549,7 @@ class MainWindow(QMainWindow):
                     'data': msg.data,
                     'is_extended': msg.is_extended,
                     'cycle_time_ms': msg.cycle_time_ms,
+                    'increment_byte': msg.increment_byte,
                     'is_paused': msg.is_paused,
                     'comment': msg.comment
                 })
@@ -1401,6 +1560,7 @@ class MainWindow(QMainWindow):
                     'trigger_id': rule.trigger_id,
                     'response_id': rule.response_id,
                     'response_data': rule.response_data,
+                    'increment_byte': rule.increment_byte,
                     'is_extended': rule.is_extended,
                     'delay_ms': rule.delay_ms,
                     'comment': rule.comment,
@@ -1481,6 +1641,7 @@ class MainWindow(QMainWindow):
                     data=msg_data['data'],
                     is_extended=msg_data.get('is_extended', True),
                     cycle_time_ms=msg_data.get('cycle_time_ms', 100),
+                    increment_byte=msg_data.get('increment_byte', -1),
                     is_paused=msg_data.get('is_paused', False),
                     comment=msg_data.get('comment', '')
                 )
@@ -1492,6 +1653,7 @@ class MainWindow(QMainWindow):
                     trigger_id=rule_data['trigger_id'],
                     response_id=rule_data['response_id'],
                     response_data=rule_data['response_data'],
+                    increment_byte=rule_data.get('increment_byte', -1),
                     is_extended=rule_data.get('is_extended', True),
                     delay_ms=rule_data.get('delay_ms', 0),
                     comment=rule_data.get('comment', ''),
@@ -1934,4 +2096,130 @@ class MainWindow(QMainWindow):
                 # Update rule using proper method
                 self.can_manager.update_response_rule(row, new_rule)
                 self._update_rules_table()
+
+    # === Simulation Controls ===
+    
+    def _sim_start(self):
+        """Start or resume the simulation"""
+        if self.sim_engine.is_paused:
+            self.sim_engine.start()
+            return
+        
+        # Generate a new profile from the selected option
+        idx = self.sim_profile_combo.currentIndex()
+        if idx < 0 or idx >= len(self._available_profiles):
+            QMessageBox.warning(self, "Simulation", "Please select a profile.")
+            return
+        
+        profile_info = self._available_profiles[idx]
+        profile = profile_info.get('_loaded_profile')
+        if not profile and profile_info.get('generator'):
+            profile = profile_info['generator'](**profile_info['kwargs'])
+        
+        self.sim_engine.load_profile(profile)
+        
+        # Apply current speed
+        self._on_sim_speed_changed(self.sim_speed_combo.currentText())
+        
+        if not self.sim_engine.start():
+            QMessageBox.warning(self, "Simulation", 
+                "Cannot start simulation.\nMake sure CAN bus is connected.")
+    
+    def _sim_import_csv(self):
+        """Import a CSV file as a trip profile"""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Import Trip CSV", "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not filepath:
+            return
+        
+        try:
+            profile = TripProfileGenerator.load_csv_profile(filepath)
+            # Add to combo and select it
+            import os
+            name = f"CSV: {os.path.basename(filepath)}"
+            self._available_profiles.append({
+                'name': name,
+                'generator': None,  # Already generated
+                'kwargs': {},
+                'description': f'Real trip data ({profile.point_count} points, {profile.duration_min:.0f} min)',
+                '_loaded_profile': profile  # Store the loaded profile
+            })
+            self.sim_profile_combo.addItem(name)
+            self.sim_profile_combo.setCurrentIndex(self.sim_profile_combo.count() - 1)
+            
+            QMessageBox.information(self, "CSV Imported",
+                f"Loaded trip profile:\n"
+                f"• {profile.point_count} data points\n"
+                f"• Duration: {profile.duration_min:.1f} min\n"
+                f"• Voltage: {profile.data_points[0].voltage_V:.1f}V → {profile.data_points[-1].voltage_V:.1f}V\n"
+                f"• Max speed: {max(dp.speed_kmh for dp in profile.data_points)} km/h")
+        except Exception as e:
+            QMessageBox.warning(self, "Import Error", f"Failed to load CSV:\n{str(e)}")
+    
+    def _sim_pause(self):
+        """Pause/resume the simulation"""
+        if self.sim_engine.is_running:
+            if self.sim_engine.is_paused:
+                self.sim_engine.start()  # Resume
+                self.sim_pause_btn.setText("⏸ Pause")
+            else:
+                self.sim_engine.pause()
+                self.sim_pause_btn.setText("▶ Resume")
+    
+    def _sim_stop(self):
+        """Stop the simulation"""
+        self.sim_engine.stop()
+        self._on_sim_finished()
+    
+    def _on_sim_speed_changed(self, text: str):
+        """Handle simulation speed change"""
+        try:
+            speed = float(text.replace('x', ''))
+            self.sim_engine.playback_speed = speed
+        except ValueError:
+            pass
+    
+    def _on_sim_started(self):
+        """Handle simulation started"""
+        self.sim_start_btn.setEnabled(False)
+        self.sim_pause_btn.setEnabled(True)
+        self.sim_stop_btn.setEnabled(True)
+        self.sim_profile_combo.setEnabled(False)
+        self.sim_progress.setFormat("%p% — Running")
+    
+    def _on_sim_progress(self, progress: int):
+        """Handle simulation progress update"""
+        self.sim_progress.setValue(progress)
+    
+    def _on_sim_data_updated(self, data: dict):
+        """Handle simulation live data update"""
+        self.sim_voltage_label.setText(f"{data['voltage']:.1f} V")
+        self.sim_current_label.setText(f"{data['current']:.1f} A")
+        self.sim_soc_label.setText(f"{data['soc']:.1f} %")
+        self.sim_speed_label.setText(f"{data['speed']} km/h")
+        self.sim_mileage_label.setText(f"{data['mileage']:.1f} km")
+        self.sim_gear_label.setText(f"{data['gear']}")
+    
+    def _on_sim_finished(self):
+        """Handle simulation finished"""
+        self.sim_start_btn.setEnabled(True)
+        self.sim_pause_btn.setEnabled(False)
+        self.sim_pause_btn.setText("⏸ Pause")
+        self.sim_stop_btn.setEnabled(False)
+        self.sim_profile_combo.setEnabled(True)
+        self.sim_progress.setFormat("Ready")
+        self.sim_progress.setValue(0)
+        # Reset live data
+        self.sim_voltage_label.setText("---")
+        self.sim_current_label.setText("---")
+        self.sim_soc_label.setText("---")
+        self.sim_speed_label.setText("---")
+        self.sim_mileage_label.setText("---")
+        self.sim_gear_label.setText("---")
+    
+    def _on_sim_status(self, msg: str):
+        """Handle simulation status message"""
+        self.status_label.setText(msg)
 

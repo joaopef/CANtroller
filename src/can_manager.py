@@ -19,6 +19,7 @@ class ResponseRule:
     delay_ms: int = 0
     comment: str = ""
     enabled: bool = True
+    increment_byte: int = -1  # -1 = disabled, 0-7 = byte index to auto-increment
 
 
 @dataclass
@@ -31,6 +32,7 @@ class TransmitMessage:
     is_paused: bool = False
     comment: str = ""
     count: int = 0
+    increment_byte: int = -1  # -1 = disabled, 0-7 = byte index to auto-increment
     # Internal state
     _timer: Optional[QTimer] = field(default=None, repr=False)
 
@@ -250,8 +252,11 @@ class CANManager(QObject):
         msg._timer.start(msg.cycle_time_ms)
     
     def _send_periodic(self, msg: TransmitMessage):
-        """Send a periodic message"""
+        """Send a periodic message, with optional byte auto-increment"""
         if not msg.is_paused and self.is_connected:
+            # Auto-increment the chosen byte before sending
+            if 0 <= msg.increment_byte < len(msg.data):
+                msg.data[msg.increment_byte] = (msg.data[msg.increment_byte] + 1) & 0xFF
             self.send_message(msg.msg_id, msg.data, msg.is_extended)
             msg.count += 1
     
@@ -303,6 +308,12 @@ class CANManager(QObject):
                 # Apply delay if specified
                 if rule.delay_ms > 0:
                     time.sleep(rule.delay_ms / 1000.0)
+                
+                # Auto-increment chosen byte before responding
+                if 0 <= rule.increment_byte < len(rule.response_data):
+                    rule.response_data[rule.increment_byte] = (
+                        rule.response_data[rule.increment_byte] + 1
+                    ) & 0xFF
                 
                 # Send response
                 self.send_message(
