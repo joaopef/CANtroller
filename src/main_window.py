@@ -2,27 +2,28 @@
 Main Window - CANtroller application interface
 """
 import time
-import re
 import json
 import os
 import sys
-import csv
 from datetime import datetime
 from typing import Dict, Optional, List
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTableWidget, QTableWidgetItem, QToolBar, QStatusBar, QLabel,
     QComboBox, QPushButton, QGroupBox, QHeaderView, QMessageBox,
-    QDialog, QFormLayout, QLineEdit, QCheckBox, QSpinBox, QDialogButtonBox,
-    QMenu, QMenuBar, QTabWidget, QFrame, QFileDialog, QApplication,
-    QProgressBar, QSlider, QGridLayout
+    QMenu, QMenuBar, QTabWidget, QFileDialog, QApplication,
+    QProgressBar, QGridLayout, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer, QMimeData
-from PyQt6.QtGui import QAction, QIcon, QColor, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
 import can
 
 from can_manager import CANManager, ResponseRule, TransmitMessage
 from simulator import SimulationEngine, TripProfileGenerator
+from config_manager import ConfigManager
+from widgets.hex_inputs import HexDataLineEdit, HexByteLineEdit
+from dialogs.rule_dialog import AddRuleDialog
+from dialogs.transmit_dialog import NewTransmitMessageDialog
 
 # Settings file path - use app directory for PyInstaller compatibility
 def get_settings_path():
@@ -35,370 +36,6 @@ def get_settings_path():
     return os.path.join(app_dir, 'settings.json')
 
 SETTINGS_FILE = get_settings_path()
-
-
-class HexDataLineEdit(QLineEdit):
-    """Custom QLineEdit that auto-formats hex data with spaces"""
-    
-    def __init__(self, placeholder="", parent=None):
-        super().__init__(parent)
-        self.setPlaceholderText(placeholder)
-        self.textChanged.connect(self._on_text_changed)
-        self._updating = False
-    
-    def _on_text_changed(self, text: str):
-        if self._updating:
-            return
-        
-        self._updating = True
-        
-        # Remove all spaces and non-hex characters
-        clean = re.sub(r'[^0-9A-Fa-f]', '', text)
-        
-        # Split into pairs and join with spaces
-        pairs = [clean[i:i+2] for i in range(0, len(clean), 2)]
-        formatted = ' '.join(pairs).upper()
-        
-        # Preserve cursor position
-        cursor_pos = self.cursorPosition()
-        old_len = len(text)
-        
-        self.setText(formatted)
-        
-        # Adjust cursor position
-        new_len = len(formatted)
-        if new_len > old_len:
-            self.setCursorPosition(cursor_pos + (new_len - old_len))
-        else:
-            self.setCursorPosition(min(cursor_pos, new_len))
-        
-        self._updating = False
-
-
-class HexByteLineEdit(QLineEdit):
-    """Custom QLineEdit for single byte hex input with auto-advance"""
-    
-    def __init__(self, next_edit=None, parent=None):
-        super().__init__("00", parent)
-        self.setMaximumWidth(35)
-        self.setMaxLength(2)
-        self.next_edit = next_edit
-        self.textChanged.connect(self._on_text_changed)
-        self._updating = False
-    
-    def set_next_edit(self, next_edit):
-        self.next_edit = next_edit
-    
-    def _on_text_changed(self, text: str):
-        if self._updating:
-            return
-        
-        self._updating = True
-        
-        # Keep only hex characters
-        clean = re.sub(r'[^0-9A-Fa-f]', '', text).upper()
-        self.setText(clean)
-        
-        # Auto-advance to next field when 2 chars entered
-        if len(clean) == 2 and self.next_edit and self.next_edit.isEnabled():
-            self.next_edit.setFocus()
-            self.next_edit.selectAll()
-        
-        self._updating = False
-
-
-class AddRuleDialog(QDialog):
-    """Dialog for adding/editing response rules"""
-    
-    def __init__(self, parent=None, rule: Optional[ResponseRule] = None):
-        super().__init__(parent)
-        self.setWindowTitle("Add Response Rule" if rule is None else "Edit Response Rule")
-        self.setMinimumWidth(400)
-        
-        layout = QFormLayout(self)
-        
-        # Trigger ID
-        self.trigger_id_edit = QLineEdit()
-        self.trigger_id_edit.setPlaceholderText("e.g., 18900240")
-        layout.addRow("Trigger ID (hex):", self.trigger_id_edit)
-        
-        # Response ID
-        self.response_id_edit = QLineEdit()
-        self.response_id_edit.setPlaceholderText("e.g., 18904002")
-        layout.addRow("Response ID (hex):", self.response_id_edit)
-        
-        # Response Data with auto-spacing
-        self.response_data_edit = HexDataLineEdit("e.g., 03 E8 00 64 00 32 00 00")
-        layout.addRow("Response Data (hex):", self.response_data_edit)
-        
-        # Extended ID checkbox
-        self.extended_check = QCheckBox("Extended ID (29-bit)")
-        self.extended_check.setChecked(True)
-        layout.addRow("", self.extended_check)
-        
-        # Delay
-        self.delay_spin = QSpinBox()
-        self.delay_spin.setRange(0, 10000)
-        self.delay_spin.setSuffix(" ms")
-        layout.addRow("Response Delay:", self.delay_spin)
-        
-        # Comment
-        self.comment_edit = QLineEdit()
-        self.comment_edit.setPlaceholderText("e.g., BMS_Response")
-        layout.addRow("Comment:", self.comment_edit)
-        
-        # Increment Byte (auto-counter)
-        self.increment_combo = QComboBox()
-        self.increment_combo.addItem("None", -1)
-        for i in range(8):
-            self.increment_combo.addItem(f"Byte {i}", i)
-        self.increment_combo.setToolTip("Auto-increment the selected byte\non each response (wraps 255→0)")
-        layout.addRow("Increment Byte:", self.increment_combo)
-        
-        # Buttons
-        self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        self.buttons.accepted.connect(self._validate_and_accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addRow(self.buttons)
-        
-        # Fill in existing rule data if editing
-        if rule:
-            self.trigger_id_edit.setText(f"{rule.trigger_id:X}")
-            self.response_id_edit.setText(f"{rule.response_id:X}")
-            self.response_data_edit.setText(" ".join(f"{b:02X}" for b in rule.response_data))
-            self.extended_check.setChecked(rule.is_extended)
-            self.delay_spin.setValue(rule.delay_ms)
-            self.comment_edit.setText(rule.comment)
-            # Set increment byte if configured
-            idx = self.increment_combo.findData(rule.increment_byte)
-            if idx >= 0:
-                self.increment_combo.setCurrentIndex(idx)
-    
-    def _validate_and_accept(self):
-        """Validate inputs before accepting"""
-        rule = self.get_rule()
-        if rule is not None:
-            self._valid_rule = rule
-            self.accept()
-    
-    def get_rule(self) -> Optional[ResponseRule]:
-        """Get the rule from dialog inputs"""
-        try:
-            trigger_text = self.trigger_id_edit.text().strip()
-            if not trigger_text:
-                raise ValueError("Trigger ID is required")
-            trigger_id = int(trigger_text, 16)
-            
-            response_text = self.response_id_edit.text().strip()
-            if not response_text:
-                raise ValueError("Response ID is required")
-            response_id = int(response_text, 16)
-            
-            # Parse data bytes
-            data_text = self.response_data_edit.text().strip()
-            data_bytes = [int(b, 16) for b in data_text.split()] if data_text else []
-            
-            if len(data_bytes) > 8:
-                raise ValueError("Data must be 8 bytes or less")
-            
-            # Pad to 8 bytes
-            while len(data_bytes) < 8:
-                data_bytes.append(0)
-            
-            return ResponseRule(
-                trigger_id=trigger_id,
-                response_id=response_id,
-                response_data=data_bytes,
-                is_extended=self.extended_check.isChecked(),
-                delay_ms=self.delay_spin.value(),
-                comment=self.comment_edit.text().strip(),
-                increment_byte=self.increment_combo.currentData()
-            )
-        except ValueError as e:
-            QMessageBox.warning(self, "Invalid Input", str(e))
-            return None
-    
-    def get_validated_rule(self) -> Optional[ResponseRule]:
-        """Get the validated rule after dialog closes"""
-        return getattr(self, '_valid_rule', None)
-
-
-class NewTransmitMessageDialog(QDialog):
-    """Dialog for creating a new transmit message (like PCAN-View)"""
-    
-    def __init__(self, parent=None, msg: Optional[TransmitMessage] = None):
-        super().__init__(parent)
-        self.setWindowTitle("New Transmit Message" if msg is None else "Edit Transmit Message")
-        self.setMinimumWidth(500)
-        
-        layout = QVBoxLayout(self)
-        
-        # Top row: ID, Length, Data
-        top_layout = QHBoxLayout()
-        
-        # ID
-        id_layout = QVBoxLayout()
-        id_layout.addWidget(QLabel("ID: (hex)"))
-        self.id_edit = QLineEdit()
-        self.id_edit.setPlaceholderText("000")
-        self.id_edit.setMaximumWidth(100)
-        id_layout.addWidget(self.id_edit)
-        top_layout.addLayout(id_layout)
-        
-        # Length
-        len_layout = QVBoxLayout()
-        len_layout.addWidget(QLabel("Length:"))
-        self.length_combo = QComboBox()
-        self.length_combo.addItems([str(i) for i in range(9)])
-        self.length_combo.setCurrentIndex(8)
-        self.length_combo.currentIndexChanged.connect(self._update_data_fields)
-        len_layout.addWidget(self.length_combo)
-        top_layout.addLayout(len_layout)
-        
-        # Data bytes with auto-tab
-        data_layout = QVBoxLayout()
-        data_layout.addWidget(QLabel("Data: (hex)"))
-        data_bytes_layout = QHBoxLayout()
-        self.data_edits = []
-        for i in range(8):
-            edit = HexByteLineEdit()
-            self.data_edits.append(edit)
-            byte_layout = QVBoxLayout()
-            byte_layout.addWidget(edit)
-            byte_layout.addWidget(QLabel(str(i)))
-            data_bytes_layout.addLayout(byte_layout)
-        
-        # Set up next_edit chain for auto-tab
-        for i in range(7):
-            self.data_edits[i].set_next_edit(self.data_edits[i + 1])
-        
-        data_layout.addLayout(data_bytes_layout)
-        top_layout.addLayout(data_layout)
-        
-        layout.addLayout(top_layout)
-        
-        # Middle row: Cycle Time, Message Type
-        middle_layout = QHBoxLayout()
-        
-        # Cycle Time
-        cycle_layout = QVBoxLayout()
-        cycle_layout.addWidget(QLabel("Cycle Time:"))
-        cycle_inner = QHBoxLayout()
-        self.cycle_time_spin = QSpinBox()
-        self.cycle_time_spin.setRange(0, 100000)
-        self.cycle_time_spin.setValue(100)
-        cycle_inner.addWidget(self.cycle_time_spin)
-        cycle_inner.addWidget(QLabel("ms"))
-        cycle_layout.addLayout(cycle_inner)
-        
-        self.paused_check = QCheckBox("Paused")
-        cycle_layout.addWidget(self.paused_check)
-        middle_layout.addLayout(cycle_layout)
-        
-        # Message Type
-        type_group = QGroupBox("Message Type")
-        type_layout = QVBoxLayout(type_group)
-        self.extended_check = QCheckBox("Extended Frame")
-        self.extended_check.setChecked(True)
-        type_layout.addWidget(self.extended_check)
-        self.remote_check = QCheckBox("Remote Request")
-        type_layout.addWidget(self.remote_check)
-        middle_layout.addWidget(type_group)
-        
-        # Increment Byte (auto-counter)
-        inc_group = QGroupBox("Auto-Increment")
-        inc_layout = QVBoxLayout(inc_group)
-        self.increment_combo = QComboBox()
-        self.increment_combo.addItem("None", -1)
-        for i in range(8):
-            self.increment_combo.addItem(f"Byte {i}", i)
-        self.increment_combo.setToolTip("Auto-increment the selected byte\non each send cycle (wraps 255→0)")
-        inc_layout.addWidget(self.increment_combo)
-        middle_layout.addWidget(inc_group)
-        
-        middle_layout.addStretch()
-        layout.addLayout(middle_layout)
-        
-        # Comment
-        comment_layout = QHBoxLayout()
-        comment_layout.addWidget(QLabel("Comment:"))
-        self.comment_edit = QLineEdit()
-        comment_layout.addWidget(self.comment_edit)
-        layout.addLayout(comment_layout)
-        
-        # Buttons
-        self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        self.buttons.accepted.connect(self._validate_and_accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-        
-        # Fill in existing message data if editing
-        if msg:
-            self.id_edit.setText(f"{msg.msg_id:X}")
-            self.length_combo.setCurrentIndex(len(msg.data))
-            for i, b in enumerate(msg.data):
-                if i < 8:
-                    self.data_edits[i].setText(f"{b:02X}")
-            self.cycle_time_spin.setValue(msg.cycle_time_ms)
-            self.paused_check.setChecked(msg.is_paused)
-            self.extended_check.setChecked(msg.is_extended)
-            self.comment_edit.setText(msg.comment)
-            # Set increment byte if configured
-            idx = self.increment_combo.findData(msg.increment_byte)
-            if idx >= 0:
-                self.increment_combo.setCurrentIndex(idx)
-    
-    def _update_data_fields(self, length: int):
-        """Enable/disable data fields based on length"""
-        for i, edit in enumerate(self.data_edits):
-            edit.setEnabled(i < length)
-            if i >= length:
-                edit.setText("00")
-    
-    def _validate_and_accept(self):
-        """Validate inputs before accepting"""
-        msg = self.get_message()
-        if msg is not None:
-            self._valid_msg = msg
-            self.accept()
-    
-    def get_message(self) -> Optional[TransmitMessage]:
-        """Get the transmit message from dialog inputs"""
-        try:
-            id_text = self.id_edit.text().strip()
-            if not id_text:
-                raise ValueError("Message ID is required")
-            msg_id = int(id_text, 16)
-            length = int(self.length_combo.currentText())
-            
-            # Parse data bytes
-            data_bytes = []
-            for i in range(length):
-                byte_text = self.data_edits[i].text().strip()
-                if not byte_text:
-                    byte_text = "00"
-                data_bytes.append(int(byte_text, 16))
-            
-            return TransmitMessage(
-                msg_id=msg_id,
-                data=data_bytes,
-                is_extended=self.extended_check.isChecked(),
-                cycle_time_ms=self.cycle_time_spin.value(),
-                is_paused=self.paused_check.isChecked(),
-                comment=self.comment_edit.text().strip(),
-                increment_byte=self.increment_combo.currentData()
-            )
-        except ValueError as e:
-            QMessageBox.warning(self, "Invalid Input", f"Invalid hex value: {e}")
-            return None
-    
-    def get_validated_message(self) -> Optional[TransmitMessage]:
-        """Get the validated message after dialog closes"""
-        return getattr(self, '_valid_msg', None)
 
 
 class MainWindow(QMainWindow):
@@ -414,14 +51,17 @@ class MainWindow(QMainWindow):
         
         # CAN Manager
         self.can_manager = CANManager()
-        self.can_manager.message_received.connect(self._on_message_received)
+        # NOTE: message_received signal no longer used — using batch RX timer instead
         self.can_manager.message_sent.connect(self._on_message_sent)
         self.can_manager.connection_changed.connect(self._on_connection_changed)
         self.can_manager.error_occurred.connect(self._on_error)
         self.can_manager.status_updated.connect(self._on_status_updated)
         
+        # Config Manager (handles save/load/import/export)
+        self.config_mgr = ConfigManager(self.can_manager)
+        
         # Message tracking
-        self.receive_messages: Dict[int, dict] = {}  # id -> {msg, count, first_time, last_time, timestamp}
+        self.receive_messages: Dict[int, dict] = {}
         self.transmit_count: Dict[int, int] = {}
         
         # Local counters for status bar
@@ -433,16 +73,6 @@ class MainWindow(QMainWindow):
         
         # Display mode: 'hex', 'decimal', or 'decoded'
         self.display_mode = 'hex'
-        
-        # CAN ID Database (from CSV/MD import)
-        self.id_database: Dict[int, str] = {}  # id -> name
-        
-        # CAN Block Name -> ID mapping (for signal lookup by block name)
-        self.name_to_id: Dict[str, int] = {}  # block_name -> id
-        
-        # Signal database: CAN ID -> list of signal definitions
-        # Each signal: {name, bit_start, bit_length, factor, unit}
-        self.signal_database: Dict[int, List[dict]] = {}
         
         # Current config file
         self.current_file = None
@@ -456,6 +86,11 @@ class MainWindow(QMainWindow):
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self._update_cycle_times)
         self.update_timer.start(100)
+        
+        # RX batch processing timer (~30 FPS)
+        self.rx_timer = QTimer()
+        self.rx_timer.timeout.connect(self._process_rx_batch)
+        self.rx_timer.start(33)
         
         # Status update timer
         self.status_timer = QTimer()
@@ -473,6 +108,28 @@ class MainWindow(QMainWindow):
         self.sim_engine.simulation_finished.connect(self._on_sim_finished)
         self.sim_engine.simulation_started.connect(self._on_sim_started)
         self.sim_engine.status_message.connect(self._on_sim_status)
+    
+    # === Property delegators to ConfigManager ===
+    @property
+    def id_database(self):
+        return self.config_mgr.id_database
+    @id_database.setter
+    def id_database(self, val):
+        self.config_mgr.id_database = val
+    
+    @property
+    def signal_database(self):
+        return self.config_mgr.signal_database
+    @signal_database.setter
+    def signal_database(self, val):
+        self.config_mgr.signal_database = val
+    
+    @property
+    def name_to_id(self):
+        return self.config_mgr.name_to_id
+    @name_to_id.setter
+    def name_to_id(self, val):
+        self.config_mgr.name_to_id = val
     
     def _setup_ui(self):
         """Setup the main UI layout"""
@@ -1077,8 +734,17 @@ class MainWindow(QMainWindow):
         
         menu.exec(self.periodic_table.mapToGlobal(pos))
     
-    def _on_message_received(self, msg: can.Message):
-        """Handle received CAN message"""
+    def _process_rx_batch(self):
+        """Process buffered RX messages in batch (~30 FPS)"""
+        msgs = self.can_manager.drain_rx_buffer()
+        if not msgs:
+            return
+        for msg in msgs:
+            self._on_message_received_internal(msg)
+        self._update_receive_table()
+    
+    def _on_message_received_internal(self, msg):
+        """Handle a single received CAN message (called from batch processor)"""
         msg_id = msg.arbitration_id
         current_time = time.time()
         
@@ -1097,8 +763,6 @@ class MainWindow(QMainWindow):
                 'first_time': current_time,
                 'last_time': current_time
             }
-        
-        self._update_receive_table()
     
     def _on_message_sent(self, msg: can.Message):
         """Handle sent CAN message"""
@@ -1449,64 +1113,10 @@ class MainWindow(QMainWindow):
             "CANtroller Config (*.cantroller);;JSON Files (*.json);;All Files (*)"
         )
         if filename:
-            try:
-                with open(filename, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                
-                # Clear existing
-                self.can_manager.clear_transmit_messages()
-                self.can_manager.clear_response_rules()
-                
-                # Load periodic messages
-                for msg_data in config.get('periodic_messages', []):
-                    msg = TransmitMessage(
-                        msg_id=msg_data['msg_id'],
-                        data=msg_data['data'],
-                        is_extended=msg_data.get('is_extended', True),
-                        cycle_time_ms=msg_data.get('cycle_time_ms', 100),
-                    increment_byte=msg_data.get('increment_byte', -1),
-                        is_paused=msg_data.get('is_paused', False),
-                        comment=msg_data.get('comment', '')
-                    )
-                    self.can_manager.add_transmit_message(msg)
-                
-                # Load response rules
-                for rule_data in config.get('response_rules', []):
-                    rule = ResponseRule(
-                        trigger_id=rule_data['trigger_id'],
-                        response_id=rule_data['response_id'],
-                        response_data=rule_data['response_data'],
-                    increment_byte=rule_data.get('increment_byte', -1),
-                        is_extended=rule_data.get('is_extended', True),
-                        delay_ms=rule_data.get('delay_ms', 0),
-                        comment=rule_data.get('comment', ''),
-                        enabled=rule_data.get('enabled', True)
-                    )
-                    self.can_manager.add_response_rule(rule)
-                
-                # Load connection settings if present
-                if 'settings' in config:
-                    settings = config['settings']
-                    channel = settings.get('channel', 'PCAN_USBBUS1')
-                    bitrate = settings.get('bitrate', '500 kbit/s')
-                    
-                    # Set combo boxes
-                    idx = self.channel_combo.findText(channel)
-                    if idx >= 0:
-                        self.channel_combo.setCurrentIndex(idx)
-                    idx = self.bitrate_combo.findText(bitrate)
-                    if idx >= 0:
-                        self.bitrate_combo.setCurrentIndex(idx)
-                
-                self.current_file = filename
-                self._update_window_title()
-                self._update_periodic_table()
-                self._update_rules_table()
-                
+            if self._load_config_file(filename):
                 QMessageBox.information(self, "Success", f"Configuration loaded from:\n{filename}")
-                
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to load configuration:\n{str(e)}")
+            else:
+                QMessageBox.warning(self, "Error", f"Failed to load configuration:\n{filename}")
     
     def _save_config(self):
         """Save configuration to current file or prompt for new file"""
@@ -1532,50 +1142,15 @@ class MainWindow(QMainWindow):
     def _save_to_file(self, filename: str):
         """Save configuration to specified file"""
         try:
-            config = {
-                'version': '1.0',
-                'settings': {
-                    'channel': self.channel_combo.currentText(),
-                    'bitrate': self.bitrate_combo.currentText()
-                },
-                'periodic_messages': [],
-                'response_rules': []
-            }
-            
-            # Save periodic messages
-            for msg in self.can_manager.get_transmit_messages():
-                config['periodic_messages'].append({
-                    'msg_id': msg.msg_id,
-                    'data': msg.data,
-                    'is_extended': msg.is_extended,
-                    'cycle_time_ms': msg.cycle_time_ms,
-                    'increment_byte': msg.increment_byte,
-                    'is_paused': msg.is_paused,
-                    'comment': msg.comment
-                })
-            
-            # Save response rules
-            for rule in self.can_manager.get_response_rules():
-                config['response_rules'].append({
-                    'trigger_id': rule.trigger_id,
-                    'response_id': rule.response_id,
-                    'response_data': rule.response_data,
-                    'increment_byte': rule.increment_byte,
-                    'is_extended': rule.is_extended,
-                    'delay_ms': rule.delay_ms,
-                    'comment': rule.comment,
-                    'enabled': rule.enabled
-                })
-            
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2)
-            
+            self.config_mgr.save_config(
+                filename,
+                self.channel_combo.currentText(),
+                self.bitrate_combo.currentText()
+            )
             self.current_file = filename
             self._update_window_title()
-            self._save_settings()  # Save last file path
-            
+            self._save_settings()
             QMessageBox.information(self, "Success", f"Configuration saved to:\n{filename}")
-            
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to save configuration:\n{str(e)}")
     
@@ -1583,90 +1158,25 @@ class MainWindow(QMainWindow):
     
     def _load_settings(self):
         """Load application settings from file"""
-        try:
-            if os.path.exists(SETTINGS_FILE):
-                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-                
-                # Restore display mode
-                self.display_mode = settings.get('display_mode', 'hex')
-                
-                # Restore ID database
-                id_db = settings.get('id_database', {})
-                self.id_database = {int(k): v for k, v in id_db.items()}
-                
-                # Restore signal database
-                sig_db = settings.get('signal_database', {})
-                self.signal_database = {int(k): v for k, v in sig_db.items()}
-                
-                # Restore name_to_id mapping
-                self.name_to_id = settings.get('name_to_id', {})
-                
-                # Auto-open last file
-                last_file = settings.get('last_file')
-                if last_file and os.path.exists(last_file):
-                    self._load_config_file(last_file)
-        except Exception:
-            pass  # Ignore errors, use defaults
+        result = self.config_mgr.load_settings(SETTINGS_FILE)
+        self.display_mode = result['display_mode']
+        last_file = result.get('last_file')
+        if last_file and os.path.exists(last_file):
+            self._load_config_file(last_file)
     
     def _save_settings(self):
         """Save application settings to file"""
-        try:
-            settings = {
-                'last_file': self.current_file,
-                'display_mode': self.display_mode,
-                'id_database': {str(k): v for k, v in self.id_database.items()},
-                'signal_database': {str(k): v for k, v in self.signal_database.items()},
-                'name_to_id': self.name_to_id
-            }
-            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(settings, f, indent=2)
-        except Exception:
-            pass  # Ignore errors
+        self.config_mgr.save_settings(SETTINGS_FILE, self.current_file, self.display_mode)
     
     def _load_config_file(self, filename: str):
         """Load configuration from file (internal helper)"""
         try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                config = json.load(f)
+            settings = self.config_mgr.load_config(filename)
             
-            # Clear existing
-            self.can_manager.clear_transmit_messages()
-            self.can_manager.clear_response_rules()
-            
-            # Load periodic messages
-            for msg_data in config.get('periodic_messages', []):
-                msg = TransmitMessage(
-                    msg_id=msg_data['msg_id'],
-                    data=msg_data['data'],
-                    is_extended=msg_data.get('is_extended', True),
-                    cycle_time_ms=msg_data.get('cycle_time_ms', 100),
-                    increment_byte=msg_data.get('increment_byte', -1),
-                    is_paused=msg_data.get('is_paused', False),
-                    comment=msg_data.get('comment', '')
-                )
-                self.can_manager.add_transmit_message(msg)
-            
-            # Load response rules
-            for rule_data in config.get('response_rules', []):
-                rule = ResponseRule(
-                    trigger_id=rule_data['trigger_id'],
-                    response_id=rule_data['response_id'],
-                    response_data=rule_data['response_data'],
-                    increment_byte=rule_data.get('increment_byte', -1),
-                    is_extended=rule_data.get('is_extended', True),
-                    delay_ms=rule_data.get('delay_ms', 0),
-                    comment=rule_data.get('comment', ''),
-                    enabled=rule_data.get('enabled', True)
-                )
-                self.can_manager.add_response_rule(rule)
-            
-            # Load connection settings if present
-            if 'settings' in config:
-                settings = config['settings']
+            # Apply connection settings if present
+            if settings:
                 channel = settings.get('channel', 'PCAN_USBBUS1')
                 bitrate = settings.get('bitrate', '500 kbit/s')
-                
                 idx = self.channel_combo.findText(channel)
                 if idx >= 0:
                     self.channel_combo.setCurrentIndex(idx)
@@ -1715,72 +1225,34 @@ class MainWindow(QMainWindow):
         
         extensions = {'csv': 'CSV Files (*.csv)', 'txt': 'Text Files (*.txt)', 'asc': 'ASC Files (*.asc)'}
         filename, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Logs",
-            f"can_log.{format_type}",
+            self, "Export Logs", f"can_log.{format_type}",
             extensions.get(format_type, 'All Files (*)')
         )
-        
         if not filename:
             return
         
         try:
-            with open(filename, 'w', encoding='utf-8', newline='') as f:
-                if format_type == 'csv':
-                    writer = csv.writer(f)
-                    writer.writerow(['Timestamp', 'CAN-ID', 'Name', 'Type', 'Length', 'Data', 'Count'])
-                    for msg_id, entry in sorted(self.receive_messages.items()):
-                        msg = entry['msg']
-                        id_hex = f"{msg_id:08X}" if msg.is_extended_id else f"{msg_id:03X}"
-                        name = self.id_database.get(msg_id, '')
-                        data_str = ' '.join(f"{b:02X}" for b in msg.data)
-                        timestamp = datetime.fromtimestamp(entry['last_time']).strftime('%H:%M:%S.%f')[:-3]
-                        writer.writerow([timestamp, id_hex, name, 'Ext' if msg.is_extended_id else 'Std', 
-                                        len(msg.data), data_str, entry['count']])
-                
-                elif format_type == 'txt':
-                    for msg_id, entry in sorted(self.receive_messages.items()):
-                        msg = entry['msg']
-                        id_hex = f"{msg_id:08X}" if msg.is_extended_id else f"{msg_id:03X}"
-                        data_str = ' '.join(f"{b:02X}" for b in msg.data)
-                        timestamp = datetime.fromtimestamp(entry['last_time']).strftime('%H:%M:%S.%f')[:-3]
-                        f.write(f"{timestamp}  {id_hex}  [{len(msg.data)}]  {data_str}\n")
-                
-                elif format_type == 'asc':
-                    f.write("date " + datetime.now().strftime("%a %b %d %I:%M:%S %p %Y") + "\n")
-                    f.write("base hex  timestamps absolute\n")
-                    f.write("Begin Triggerblock\n")
-                    for msg_id, entry in sorted(self.receive_messages.items()):
-                        msg = entry['msg']
-                        data_str = ' '.join(f"{b:02X}" for b in msg.data)
-                        timestamp = entry['last_time']
-                        f.write(f"   {timestamp:.6f} 1  {msg_id:08X}x       Rx   d {len(msg.data)}  {data_str}\n")
-                    f.write("End Triggerblock\n")
-            
+            self.config_mgr.export_logs(filename, format_type, self.receive_messages)
             QMessageBox.information(self, "Export", f"Logs exported to:\n{filename}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to export logs:\n{str(e)}")
     
-    # === Import CSV Database ===
+    # === Import CAN Database ===
     
     def _import_id_database(self):
         """Import CAN ID names from CSV or MD file"""
         filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import CAN ID Database",
-            "",
+            self, "Import CAN ID Database", "",
             "All Supported (*.csv *.md);;CSV Files (*.csv);;Markdown Files (*.md);;All Files (*)"
         )
-        
         if not filename:
             return
         
         try:
-            count = 0
             if filename.endswith('.md'):
-                count = self._import_md_blocks(filename)
+                count = self.config_mgr.import_md_blocks(filename)
             else:
-                count = self._import_csv_blocks(filename)
+                count = self.config_mgr.import_csv_blocks(filename)
             
             self._save_settings()
             self._update_receive_table()
@@ -1788,215 +1260,27 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to import database:\n{str(e)}")
     
-    def _import_csv_blocks(self, filename: str) -> int:
-        """Import CAN IDs from CSV file (CAN bus Nr,Name,CAN ID [hex],...)"""
-        count = 0
-        with open(filename, 'r', encoding='utf-8-sig', errors='replace') as f:
-            reader = csv.reader(f)
-            header = next(reader, None)  # Skip header
-            
-            for row in reader:
-                if len(row) < 3:
-                    continue
-                try:
-                    # Format: CAN bus Nr, Name, CAN ID [hex], ...
-                    name = row[1].strip()
-                    can_id_str = row[2].strip().replace('0x', '').replace('h', '')
-                    msg_id = int(can_id_str, 16)
-                    
-                    if msg_id and name:
-                        self.id_database[msg_id] = name
-                        self.name_to_id[name.upper()] = msg_id
-                        count += 1
-                except (ValueError, IndexError):
-                    continue
-        return count
-    
-    def _import_md_blocks(self, filename: str) -> int:
-        """Import CAN IDs from Notion-exported Markdown table"""
-        count = 0
-        with open(filename, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        for line in lines:
-            line = line.strip()
-            if not line.startswith('|') or '---' in line:
-                continue
-            
-            parts = [p.strip() for p in line.split('|')[1:-1]]
-            if len(parts) < 3 or 'CAN ID' in parts[2] or 'Name' in parts[1]:
-                continue
-            
-            try:
-                name = parts[1].strip().replace('**', '')
-                can_id_str = parts[2].strip().replace('0x', '').replace('**', '')
-                msg_id = int(can_id_str, 16)
-                
-                if msg_id and name:
-                    self.id_database[msg_id] = name
-                    self.name_to_id[name.upper()] = msg_id
-                    count += 1
-            except (ValueError, IndexError):
-                continue
-        return count
-    
     def _import_signal_database(self):
         """Import signal definitions from CSV or MD file"""
         filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import Signal Definitions",
-            "",
+            self, "Import Signal Definitions", "",
             "All Supported (*.csv *.md);;Markdown Files (*.md);;CSV Files (*.csv);;All Files (*)"
         )
-        
         if not filename:
             return
         
         try:
-            count = self._import_md_signals(filename) if filename.endswith('.md') else self._import_csv_signals(filename)
+            if filename.endswith('.md'):
+                count = self.config_mgr.import_md_signals(filename)
+            else:
+                count = self.config_mgr.import_csv_signals(filename)
             self._save_settings()
-            # Show which CAN IDs have signals defined
             can_ids = [f"0x{cid:08X}" for cid in self.signal_database.keys()]
             ids_str = ", ".join(can_ids[:5]) + ("..." if len(can_ids) > 5 else "")
             QMessageBox.information(self, "Import", 
                 f"Imported {count} signal definitions from:\n{filename}\n\nCAN IDs with signals: {ids_str}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to import signals:\n{str(e)}")
-    
-    def _import_csv_signals(self, filename: str) -> int:
-        """Import signals from CSV (CAN ID,CAN Data Point,Signal name,Bit start,Bit length,Factor,Unit)"""
-        count = 0
-        with open(filename, 'r', encoding='utf-8-sig', errors='replace') as f:
-            reader = csv.reader(f)
-            next(reader, None)  # Skip header
-            
-            for row in reader:
-                if len(row) < 5:
-                    continue
-                try:
-                    # Skip undefined/reserved signals
-                    data_point = row[1].strip() if len(row) > 1 else ''
-                    if data_point.lower().startswith('undef') or not data_point:
-                        continue
-                    
-                    msg_id = int(row[0].strip().replace('0x', ''), 16)
-                    signal_name = row[2].strip() if len(row) > 2 else data_point
-                    
-                    # Parse factor - handle non-numeric values like '—'
-                    factor = 1.0
-                    if len(row) > 5 and row[5].strip():
-                        try:
-                            factor = float(row[5].strip())
-                        except ValueError:
-                            factor = 1.0
-                    
-                    signal = {
-                        'name': signal_name[:12],
-                        'bit_start': int(row[3]),
-                        'bit_length': int(row[4]),
-                        'factor': factor,
-                        'unit': row[6].strip() if len(row) > 6 and row[6] != '—' else ''
-                    }
-                    
-                    if msg_id not in self.signal_database:
-                        self.signal_database[msg_id] = []
-                    self.signal_database[msg_id].append(signal)
-                    count += 1
-                except (ValueError, IndexError):
-                    continue
-        return count
-    
-    def _import_md_signals(self, filename: str) -> int:
-        """Import signals from Notion-exported Markdown table"""
-        count = 0
-        current_can_id = None
-        
-        with open(filename, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        for line in lines:
-            line = line.strip()
-            
-            # Look for CAN ID in headers like "### GET_SOC_1 (0x18F81280)"
-            if line.startswith('###') and '(0x' in line:
-                try:
-                    hex_start = line.find('(0x') + 3
-                    hex_end = line.find(')', hex_start)
-                    if hex_end > hex_start:
-                        current_can_id = int(line[hex_start:hex_end], 16)
-                except ValueError:
-                    current_can_id = None
-                continue
-            
-            if not line.startswith('|') or '---' in line or current_can_id is None:
-                continue
-            
-            parts = [p.strip().replace('**', '') for p in line.split('|')[1:-1]]
-            if len(parts) < 4:
-                continue
-            
-            # Skip header rows
-            if 'Signal' in parts[0] or 'Variable' in parts[0] or 'name' in parts[0].lower():
-                continue
-            
-            try:
-                name = parts[0].strip()
-                if not name or name.startswith('Reserve') or name.startswith('---'):
-                    continue
-                
-                # Parse bit_start - handle both numeric and non-numeric
-                bit_start_str = parts[2].strip()
-                try:
-                    bit_start = int(bit_start_str)
-                except ValueError:
-                    continue
-                
-                # Parse bit_length
-                bit_length_str = parts[3].strip()
-                try:
-                    bit_length = int(bit_length_str)
-                except ValueError:
-                    bit_length = 8
-                
-                # Parse factor
-                factor = 1.0
-                if len(parts) > 4 and parts[4].strip():
-                    try:
-                        factor = float(parts[4].strip())
-                    except ValueError:
-                        factor = 1.0
-                
-                # Parse unit
-                unit = parts[5].strip() if len(parts) > 5 else ''
-                # Clean up unit (remove ? and extra chars)
-                unit = unit.replace('?', '').strip()
-                
-                if current_can_id not in self.signal_database:
-                    self.signal_database[current_can_id] = []
-                self.signal_database[current_can_id].append({
-                    'name': name[:15], 'bit_start': bit_start,
-                    'bit_length': bit_length, 'factor': factor, 'unit': unit
-                })
-                count += 1
-            except (ValueError, IndexError):
-                continue
-        
-        return count
-    
-    def _process_csv_row(self, row: list) -> bool:
-        """Process a single CSV row for ID database"""
-        if len(row) < 2:
-            return False
-        try:
-            id_str = row[0].strip().replace('0x', '').replace('h', '')
-            msg_id = int(id_str, 16)
-            name = row[1].strip()
-            if msg_id and name:
-                self.id_database[msg_id] = name
-                return True
-        except (ValueError, IndexError):
-            pass
-        return False
     
     # === Header Click for HEX/Decimal/Decoded Toggle ===
     

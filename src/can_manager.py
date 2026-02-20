@@ -4,6 +4,7 @@ CAN Manager - Handles PCAN connection and message handling
 import can
 import threading
 import time
+from collections import deque
 from typing import Callable, Optional, List, Dict
 from dataclasses import dataclass, field
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
@@ -41,11 +42,12 @@ class CANManager(QObject):
     """Manages PCAN-USB connection and CAN message handling"""
     
     # Signals for thread-safe GUI updates
-    message_received = pyqtSignal(object)  # can.Message
+    message_received = pyqtSignal(object)  # can.Message (kept for compatibility)
     connection_changed = pyqtSignal(bool, str)  # connected, status_text
     message_sent = pyqtSignal(object)  # can.Message
     error_occurred = pyqtSignal(str)
     status_updated = pyqtSignal(dict)  # status info dict
+    _delayed_response = pyqtSignal(object)  # ResponseRule — internal signal for delayed sends
     
     BITRATES = {
         "125 kbit/s": 125000,
@@ -73,11 +75,17 @@ class CANManager(QObject):
         self._channel = ""
         self._bitrate = 0
         
+        # RX buffer for batch processing (thread-safe deque)
+        self._rx_buffer: deque = deque(maxlen=10000)
+        
         # Statistics
         self._rx_count = 0
         self._tx_count = 0
         self._error_count = 0
         self._overruns = 0
+        
+        # Connect internal delayed response signal
+        self._delayed_response.connect(self._send_response)
         
     @property
     def is_connected(self) -> bool:
@@ -156,13 +164,17 @@ class CANManager(QObject):
             self.bus.send(msg)
             self._tx_count += 1
             self.message_sent.emit(msg)
-            self._emit_status()
             return True
         except Exception as e:
             self._error_count += 1
             self.error_occurred.emit(f"Send failed: {str(e)}")
-            self._emit_status()
             return False
+    
+    def drain_rx_buffer(self) -> list:
+        """Return and clear all buffered RX messages (called by GUI timer)"""
+        msgs = list(self._rx_buffer)
+        self._rx_buffer.clear()
+        return msgs
     
     def _emit_status(self):
         """Emit current status"""
@@ -287,7 +299,8 @@ class CANManager(QObject):
                 msg = self.bus.recv(timeout=0.1)
                 if msg and not self._paused:
                     self._rx_count += 1
-                    self.message_received.emit(msg)
+                    # Buffer message for batch GUI processing
+                    self._rx_buffer.append(msg)
                     
                     # Check for auto-response
                     if self._response_mode_enabled:
@@ -305,19 +318,23 @@ class CANManager(QObject):
                 continue
                 
             if received_msg.arbitration_id == rule.trigger_id:
-                # Apply delay if specified
                 if rule.delay_ms > 0:
-                    time.sleep(rule.delay_ms / 1000.0)
-                
-                # Auto-increment chosen byte before responding
-                if 0 <= rule.increment_byte < len(rule.response_data):
-                    rule.response_data[rule.increment_byte] = (
-                        rule.response_data[rule.increment_byte] + 1
-                    ) & 0xFF
-                
-                # Send response
-                self.send_message(
-                    rule.response_id,
-                    rule.response_data,
-                    rule.is_extended
-                )
+                    # Schedule response on main thread without blocking RX loop
+                    QTimer.singleShot(rule.delay_ms, lambda r=rule: self._delayed_response.emit(r))
+                else:
+                    self._send_response(rule)
+    
+    def _send_response(self, rule: ResponseRule):
+        """Send an auto-response, with optional byte increment"""
+        # Auto-increment chosen byte before responding
+        if 0 <= rule.increment_byte < len(rule.response_data):
+            rule.response_data[rule.increment_byte] = (
+                rule.response_data[rule.increment_byte] + 1
+            ) & 0xFF
+        
+        # Send response
+        self.send_message(
+            rule.response_id,
+            rule.response_data,
+            rule.is_extended
+        )
