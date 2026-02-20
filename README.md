@@ -122,18 +122,19 @@ CAN ID,CAN Data Point,Signal name,Bit start,Bit length,Factor,Unit
 ├──────────────────────────────────────────────────────────────┤
 │  ┌──────────┐   ┌──────────────┐   ┌─────────────┐          │
 │  │ main.py  │──▶│ main_window  │◀──│ can_manager  │          │
-│  │ (Entry)  │   │    (GUI)     │   │   (Logic)    │          │
+│  │ (Entry)  │   │    (GUI)     │   │   (CAN I/O)  │          │
 │  └──────────┘   └──────┬───────┘   └──────┬──────┘          │
 │                        │                   │                 │
-│                        ▼                   ▼                 │
-│                 ┌──────────────┐    ┌───────────┐            │
-│                 │  simulator   │    │python-can │            │
-│                 │  (EV Sim)    │    └─────┬─────┘            │
-│                 └──────────────┘          │                  │
-│                                          ▼                  │
-│                                   ┌───────────┐             │
-│                                   │ PCAN-USB  │             │
-│                                   └───────────┘             │
+│           ┌────────────┼────────────┐      │                 │
+│           ▼            ▼            ▼      ▼                 │
+│    ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌───────────┐    │
+│    │ widgets/ │ │ dialogs/ │ │config_mgr │ │python-can │    │
+│    │(hex edit)│ │(rule/msg)│ │(save/load)│ └─────┬─────┘    │
+│    └──────────┘ └──────────┘ └───────────┘       │          │
+│                 ┌──────────────┐                  ▼          │
+│                 │  simulator   │           ┌───────────┐     │
+│                 │  (EV Sim)    │           │ PCAN-USB  │     │
+│                 └──────────────┘           └───────────┘     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -145,9 +146,16 @@ CANtroller/
 │   └── architecture.md      # Architecture details
 ├── src/                     # Source code
 │   ├── main.py              # Entry point + dark theme
-│   ├── main_window.py       # GUI implementation (~2200 lines)
-│   ├── can_manager.py       # CAN communication logic (~320 lines)
-│   └── simulator.py         # EV simulation engine (~600 lines)
+│   ├── main_window.py       # Main GUI orchestrator (~1370 lines)
+│   ├── can_manager.py       # CAN communication + RX buffer (~330 lines)
+│   ├── config_manager.py    # Save/Load/Import/Export (~300 lines)
+│   ├── simulator.py         # EV simulation engine (~770 lines)
+│   ├── widgets/             # Custom widgets
+│   │   └── hex_inputs.py    # HexDataLineEdit, HexByteLineEdit
+│   └── dialogs/             # Dialog windows
+│       ├── rule_dialog.py   # AddRuleDialog
+│       └── transmit_dialog.py # NewTransmitMessageDialog
+├── improvements.md          # Future roadmap & implemented changes
 ├── .gitignore
 ├── LICENSE                  # MIT License
 ├── README.md
