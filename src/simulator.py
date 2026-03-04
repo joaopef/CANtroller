@@ -86,16 +86,24 @@ class TripProfileGenerator:
     """Generates synthetic trip profiles with realistic battery behavior"""
 
     # Battery parameters — CTS Battery Technology NMC pouch cells, 20S config
-    # Real specs: 72V nominal, 73Ah, 5256Wh, cutoff 60V
+    # Real specs: 72V nominal, 40Ah (per BMS datasheet), cutoff 60V
     PACK_VOLTAGE_FULL = 84.0    # 20S * 4.2V per cell (fully charged)
     PACK_VOLTAGE_NOMINAL = 72.0  # 20S * 3.6V nominal
     PACK_VOLTAGE_EMPTY = 60.0   # Cutoff voltage per spec
     PACK_CAPACITY_AH = 40.0     # 40 Ah pack (per BMS datasheet)
     MAX_CONTINUOUS_A = 110.0    # Max continuous discharge current
     MAX_PEAK_A = 250.0          # Peak current (5 seconds)
-    REGEN_EFFICIENCY = 0.7      # Regenerative braking efficiency
     AMBIENT_TEMP_C = 25.0       # Default ambient temperature
     THERMAL_RESISTANCE = 0.004  # °C per Amp (simple thermal model, tuned to real data)
+
+    # Driving modes — based on real Fulgora vehicle specs
+    # Mode: {gear, top_speed_kmh, power_pct (% of MAX_CONTINUOUS_A), regen_pct (brake regen %)}
+    DRIVING_MODES = {
+        0: {'name': 'Park',    'gear': 0, 'top_speed': 0,   'power_pct': 0.0,  'regen_pct': 0.0},
+        1: {'name': 'Eco',     'gear': 1, 'top_speed': 45,  'power_pct': 0.30, 'regen_pct': 0.20},
+        2: {'name': 'Normal',  'gear': 2, 'top_speed': 75,  'power_pct': 0.50, 'regen_pct': 0.20},
+        3: {'name': 'Sport',   'gear': 3, 'top_speed': 100, 'power_pct': 1.00, 'regen_pct': 0.0},
+    }
 
     @classmethod
     def _voltage_from_soc(cls, soc_pct: float) -> float:
@@ -118,14 +126,22 @@ class TripProfileGenerator:
                            start_soc: float = 85.0,
                            soh: float = 95.0,
                            fc_cycles: int = 120,
-                           start_odometer: int = 1250) -> TripProfile:
+                           start_odometer: int = 1250,
+                           driving_mode: int = 2) -> TripProfile:
         """
         City trip: stop-and-go traffic with variable speed.
-        Includes regenerative braking when decelerating.
+        Uses driving mode parameters for speed/power/regen limits.
+        Default: Mode 2 (Normal) — 75 km/h, 50% power, 20% regen.
         """
+        mode = cls.DRIVING_MODES.get(driving_mode, cls.DRIVING_MODES[2])
+        max_speed = mode['top_speed']
+        max_current = cls.MAX_CONTINUOUS_A * mode['power_pct']
+        regen_efficiency = mode['regen_pct']
+        gear = mode['gear']
+
         profile = TripProfile(
-            name="City Trip",
-            description=f"Stop-and-go city driving, {duration_min} min",
+            name=f"City Trip ({mode['name']})",
+            description=f"Stop-and-go city driving, {duration_min} min, Mode {driving_mode} ({mode['name']})",
             duration_min=duration_min
         )
 
@@ -145,13 +161,13 @@ class TripProfileGenerator:
                     target_speed = 0
                     next_event = t + random.randint(8, 25)
                 elif r < 0.40:
-                    target_speed = random.randint(15, 30)
+                    target_speed = random.randint(15, min(30, max_speed))
                     next_event = t + random.randint(15, 40)
                 elif r < 0.75:
-                    target_speed = random.randint(30, 50)
+                    target_speed = random.randint(30, min(50, max_speed))
                     next_event = t + random.randint(20, 50)
                 else:
-                    target_speed = random.randint(45, 60)
+                    target_speed = random.randint(min(45, max_speed), min(60, max_speed))
                     next_event = t + random.randint(10, 30)
 
             prev_speed = speed
@@ -160,19 +176,21 @@ class TripProfileGenerator:
             elif speed > target_speed:
                 speed = max(speed - random.uniform(2.0, 5.0), target_speed)
 
+            # Enforce mode speed limit
+            speed = min(speed, max_speed)
             speed_int = max(0, int(round(speed)))
             decel = prev_speed - speed  # Positive when decelerating
 
             # Current: discharge when driving, regen when braking
             if speed_int == 0 and decel <= 0:
                 current = random.uniform(0.5, 2.0)  # Idle draw
-            elif decel > 1.0 and speed_int > 5:
-                # Regenerative braking — negative current
-                regen_current = decel * 3.0 * cls.REGEN_EFFICIENCY + random.uniform(-2, 2)
-                current = -max(1.0, min(regen_current, 30.0))
+            elif decel > 1.0 and speed_int > 5 and regen_efficiency > 0:
+                # Regenerative braking — negative current (limited by mode regen %)
+                regen_current = decel * 3.0 * regen_efficiency + random.uniform(-1, 1)
+                current = -max(0.5, min(regen_current, max_current * 0.3))
             else:
                 base_current = speed_int * 0.8 + random.uniform(-3, 5)
-                current = max(1.0, min(base_current, cls.MAX_CONTINUOUS_A))
+                current = max(1.0, min(base_current, max_current))
 
             # SOC change (positive current = discharge, negative = charge/regen)
             energy_wh = current * cls.PACK_VOLTAGE_NOMINAL * (step_s / 3600.0)
@@ -181,17 +199,6 @@ class TripProfileGenerator:
             soc = max(0, min(100, soc))
 
             trip_km += speed_int * (step_s / 3600.0)
-
-            if speed_int == 0:
-                gear = 0
-            elif speed_int < 15:
-                gear = 1
-            elif speed_int < 30:
-                gear = 2
-            elif speed_int < 45:
-                gear = 3
-            else:
-                gear = 4
 
             voltage = cls._voltage_from_soc(soc)
 
@@ -232,14 +239,21 @@ class TripProfileGenerator:
                                start_soc: float = 95.0,
                                soh: float = 92.0,
                                fc_cycles: int = 200,
-                               start_odometer: int = 5200) -> TripProfile:
+                               start_odometer: int = 5200,
+                               driving_mode: int = 3) -> TripProfile:
         """
         Highway trip: steady high speed with minor variations.
-        Includes occasional regen during speed adjustments.
+        Default: Mode 3 (Sport) — no speed limit, 100% power, no regen.
         """
+        mode = cls.DRIVING_MODES.get(driving_mode, cls.DRIVING_MODES[3])
+        max_speed = mode['top_speed']
+        max_current = cls.MAX_CONTINUOUS_A * mode['power_pct']
+        regen_efficiency = mode['regen_pct']
+        gear = mode['gear']
+
         profile = TripProfile(
-            name="Highway Trip",
-            description=f"Highway cruising, {duration_min} min",
+            name=f"Highway Trip ({mode['name']})",
+            description=f"Highway cruising, {duration_min} min, Mode {driving_mode} ({mode['name']})",
             duration_min=duration_min
         )
 
@@ -249,7 +263,7 @@ class TripProfileGenerator:
         speed = 0.0
         prev_speed = 0.0
         trip_km = 0.0
-        cruise_speed = random.randint(55, 70)
+        cruise_speed = random.randint(55, min(70, max_speed))
         accel_time = 30
 
         for t in range(0, total_seconds + 1, int(step_s)):
@@ -259,18 +273,20 @@ class TripProfileGenerator:
             else:
                 speed = cruise_speed + random.uniform(-3, 3)
 
+            # Enforce mode speed limit
+            speed = min(speed, max_speed)
             speed_int = max(0, int(round(speed)))
             decel = prev_speed - speed
 
-            # Current with regen during deceleration
-            if decel > 1.0 and speed_int > 10:
-                regen_current = decel * 4.0 * cls.REGEN_EFFICIENCY + random.uniform(-1, 2)
-                current = -max(1.0, min(regen_current, 40.0))
+            # Current with regen during deceleration (only if mode allows it)
+            if decel > 1.0 and speed_int > 10 and regen_efficiency > 0:
+                regen_current = decel * 4.0 * regen_efficiency + random.uniform(-1, 1)
+                current = -max(0.5, min(regen_current, max_current * 0.3))
             elif t < accel_time:
                 current = speed_int * 1.2 + random.uniform(0, 8)
             else:
                 current = cruise_speed * 0.7 + random.uniform(-2, 4)
-            current = max(-40.0, min(current, cls.MAX_CONTINUOUS_A))
+            current = max(-max_current * 0.3, min(current, max_current))
 
             energy_wh = current * cls.PACK_VOLTAGE_NOMINAL * (step_s / 3600.0)
             total_energy_wh = cls.PACK_CAPACITY_AH * cls.PACK_VOLTAGE_NOMINAL
@@ -278,17 +294,6 @@ class TripProfileGenerator:
             soc = max(0, min(100, soc))
 
             trip_km += speed_int * (step_s / 3600.0)
-
-            if speed_int < 15:
-                gear = 1
-            elif speed_int < 30:
-                gear = 2
-            elif speed_int < 45:
-                gear = 3
-            elif speed_int < 60:
-                gear = 4
-            else:
-                gear = 5
 
             voltage = cls._voltage_from_soc(soc)
 
