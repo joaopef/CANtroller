@@ -11,6 +11,12 @@ from typing import List, Optional, Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 
+# Import PyBaMM battery model (optional dependency)
+try:
+    from battery_model import PyBaMMBatteryModel, PYBAMM_AVAILABLE
+except ImportError:
+    PYBAMM_AVAILABLE = False
+
 
 # === CAN Signal Definitions ===
 # Based on CAN Data Points.csv
@@ -32,6 +38,14 @@ MCU_CAN_ID = 0x18F86890
 # Gear: bits 45-47, factor 1
 # Flags: bits 48-63 (motor fail, grip fail, brake fail, etc.)
 
+# BMS Temperature frame: battery dynamic parameters 3 — Temperature detection point
+# Real BMS1 protocol row 16 (0x18F82881), source address 0x80 for simulator
+BMS_TEMP_CAN_ID = 0x18F82880
+# Byte 0-1: Cell Temp Average (16-bit, factor 0.1°C, big-endian)
+# Byte 2-3: Cell Temp Max (16-bit, factor 0.1°C, big-endian)
+# Byte 4-5: Cell Temp Min (16-bit, factor 0.1°C, big-endian)
+# Byte 6-7: Reserved
+
 
 @dataclass
 class TripDataPoint:
@@ -46,6 +60,7 @@ class TripDataPoint:
     total_mileage_km: int   # Odometer reading
     current_mileage_km: float  # Trip distance (fractional km)
     gear: int           # Gear 0-5
+    temperature_C: float = 25.0  # Cell temperature in °C
 
 
 @dataclass
@@ -75,10 +90,12 @@ class TripProfileGenerator:
     PACK_VOLTAGE_FULL = 84.0    # 20S * 4.2V per cell (fully charged)
     PACK_VOLTAGE_NOMINAL = 72.0  # 20S * 3.6V nominal
     PACK_VOLTAGE_EMPTY = 60.0   # Cutoff voltage per spec
-    PACK_CAPACITY_AH = 73.0     # 73 Ah pack
+    PACK_CAPACITY_AH = 40.0     # 40 Ah pack (per BMS datasheet)
     MAX_CONTINUOUS_A = 110.0    # Max continuous discharge current
     MAX_PEAK_A = 250.0          # Peak current (5 seconds)
     REGEN_EFFICIENCY = 0.7      # Regenerative braking efficiency
+    AMBIENT_TEMP_C = 25.0       # Default ambient temperature
+    THERMAL_RESISTANCE = 0.004  # °C per Amp (simple thermal model, tuned to real data)
 
     @classmethod
     def _voltage_from_soc(cls, soc_pct: float) -> float:
@@ -178,6 +195,16 @@ class TripProfileGenerator:
 
             voltage = cls._voltage_from_soc(soc)
 
+            # Simple fallback temperature model: ambient + thermal rise from current
+            if t == 0:
+                temp_C = cls.AMBIENT_TEMP_C
+            else:
+                # Thermal inertia: slow rise proportional to |current|
+                prev_temp = profile.data_points[-1].temperature_C if profile.data_points else cls.AMBIENT_TEMP_C
+                heat_gain = cls.THERMAL_RESISTANCE * abs(current) * step_s
+                heat_loss = 0.002 * (prev_temp - cls.AMBIENT_TEMP_C) * step_s
+                temp_C = prev_temp + heat_gain - heat_loss
+
             profile.data_points.append(TripDataPoint(
                 time_s=float(t),
                 voltage_V=voltage,
@@ -188,11 +215,15 @@ class TripProfileGenerator:
                 speed_kmh=speed_int,
                 total_mileage_km=start_odometer + int(trip_km),
                 current_mileage_km=round(trip_km, 1),
-                gear=gear
+                gear=gear,
+                temperature_C=round(temp_C, 1)
             ))
 
             if soc <= 0:
                 break
+
+        # If PyBaMM is available, replace voltage/SOC/temperature with physics model
+        cls._apply_pybamm_if_available(profile, start_soc / 100.0)
 
         return profile
 
@@ -261,6 +292,15 @@ class TripProfileGenerator:
 
             voltage = cls._voltage_from_soc(soc)
 
+            # Simple fallback temperature model
+            if t == 0:
+                temp_C = cls.AMBIENT_TEMP_C
+            else:
+                prev_temp = profile.data_points[-1].temperature_C if profile.data_points else cls.AMBIENT_TEMP_C
+                heat_gain = cls.THERMAL_RESISTANCE * abs(current) * step_s
+                heat_loss = 0.002 * (prev_temp - cls.AMBIENT_TEMP_C) * step_s
+                temp_C = prev_temp + heat_gain - heat_loss
+
             profile.data_points.append(TripDataPoint(
                 time_s=float(t),
                 voltage_V=voltage,
@@ -271,11 +311,15 @@ class TripProfileGenerator:
                 speed_kmh=speed_int,
                 total_mileage_km=start_odometer + int(trip_km),
                 current_mileage_km=round(trip_km, 1),
-                gear=gear
+                gear=gear,
+                temperature_C=round(temp_C, 1)
             ))
 
             if soc <= 0:
                 break
+
+        # If PyBaMM is available, replace voltage/SOC/temperature with physics model
+        cls._apply_pybamm_if_available(profile, start_soc / 100.0)
 
         return profile
 
@@ -319,6 +363,15 @@ class TripProfileGenerator:
 
             voltage = cls._voltage_from_soc(soc)
 
+            # Charging temperature model (lower currents, slower heating)
+            if t == 0:
+                temp_C = cls.AMBIENT_TEMP_C
+            else:
+                prev_temp = profile.data_points[-1].temperature_C if profile.data_points else cls.AMBIENT_TEMP_C
+                heat_gain = cls.THERMAL_RESISTANCE * abs(current) * step_s * 0.5  # Less heat during charge
+                heat_loss = 0.003 * (prev_temp - cls.AMBIENT_TEMP_C) * step_s
+                temp_C = prev_temp + heat_gain - heat_loss
+
             profile.data_points.append(TripDataPoint(
                 time_s=float(t),
                 voltage_V=voltage,
@@ -329,13 +382,54 @@ class TripProfileGenerator:
                 speed_kmh=0,
                 total_mileage_km=start_odometer,
                 current_mileage_km=0.0,
-                gear=0
+                gear=0,
+                temperature_C=round(temp_C, 1)
             ))
 
             if soc >= target_soc:
                 break
 
+        # If PyBaMM is available, replace voltage/SOC/temperature with physics model
+        cls._apply_pybamm_if_available(profile, start_soc / 100.0)
+
         return profile
+
+    @classmethod
+    def _apply_pybamm_if_available(cls, profile, initial_soc_frac: float):
+        """
+        If PyBaMM is available, re-run the drive cycle through the physics model
+        and overwrite voltage, SOC, and temperature in the profile data points.
+        """
+        if not PYBAMM_AVAILABLE:
+            return
+
+        try:
+            times = [dp.time_s for dp in profile.data_points]
+            currents = [dp.current_A for dp in profile.data_points]
+
+            model = PyBaMMBatteryModel(
+                num_cells_series=20,
+                capacity_ah=cls.PACK_CAPACITY_AH,
+                initial_soc=initial_soc_frac
+            )
+
+            result = model.simulate_drive_cycle(
+                times, currents,
+                ambient_temp_C=cls.AMBIENT_TEMP_C
+            )
+
+            # If solver failed, result is None — keep fallback values
+            if result is None:
+                return
+
+            # Overwrite data points with physics-based values
+            for i, dp in enumerate(profile.data_points):
+                dp.voltage_V = round(result['voltage'][i], 1)
+                dp.soc_pct = round(result['soc'][i], 1)
+                dp.temperature_C = round(result['temperature'][i], 1)
+
+        except Exception as e:
+            print(f"[PyBaMM] Failed to apply model, keeping fallback values: {e}")
 
     @classmethod
     def get_available_profiles(cls) -> List[dict]:
@@ -564,6 +658,40 @@ def encode_bms_frame(dp: TripDataPoint) -> List[int]:
     return data
 
 
+def encode_bms_temp_frame(dp: TripDataPoint) -> List[int]:
+    """
+    Encode BMS temperature data into 8 CAN bytes for BMS_TEMP (0x18F82880).
+
+    Layout (BIG-ENDIAN):
+      Byte 0-1: Cell Temp Average (16-bit, factor 0.1°C, big-endian)
+      Byte 2-3: Cell Temp Max (16-bit, factor 0.1°C, big-endian)
+      Byte 4-5: Cell Temp Min (16-bit, factor 0.1°C, big-endian)
+      Byte 6-7: Reserved (0x00)
+    """
+    avg_temp = dp.temperature_C
+    # Simulate small variation for max/min around the average
+    temp_max = avg_temp + random.uniform(0.5, 2.0)
+    temp_min = avg_temp - random.uniform(0.5, 2.0)
+
+    # Convert to raw values (factor 0.1°C)
+    avg_raw = int(round(avg_temp / 0.1))
+    max_raw = int(round(temp_max / 0.1))
+    min_raw = int(round(temp_min / 0.1))
+
+    # Clamp to 16-bit unsigned range
+    avg_raw = max(0, min(avg_raw, 0xFFFF))
+    max_raw = max(0, min(max_raw, 0xFFFF))
+    min_raw = max(0, min(min_raw, 0xFFFF))
+
+    data = [
+        (avg_raw >> 8) & 0xFF, avg_raw & 0xFF,     # Avg temp BE
+        (max_raw >> 8) & 0xFF, max_raw & 0xFF,     # Max temp BE
+        (min_raw >> 8) & 0xFF, min_raw & 0xFF,     # Min temp BE
+        0x00, 0x00,                                  # Reserved
+    ]
+    return data
+
+
 def encode_mcu_frame(dp: TripDataPoint) -> List[int]:
     """
     Encode MCU data point into 8 CAN data bytes for GET_MCU_KM (0x18F86890).
@@ -734,6 +862,10 @@ class SimulationEngine(QObject):
         mcu_data = encode_mcu_frame(dp)
         self._can_manager.send_message(MCU_CAN_ID, mcu_data, is_extended=True)
 
+        # Encode and send BMS Temperature frame
+        bms_temp_data = encode_bms_temp_frame(dp)
+        self._can_manager.send_message(BMS_TEMP_CAN_ID, bms_temp_data, is_extended=True)
+
         # Calculate progress
         progress = int((self._current_index / len(self._profile.data_points)) * 100)
         self.progress_changed.emit(progress)
@@ -748,6 +880,7 @@ class SimulationEngine(QObject):
             'speed': dp.speed_kmh,
             'mileage': dp.current_mileage_km,
             'gear': dp.gear,
+            'temperature': dp.temperature_C,
         })
 
         # Update status bar

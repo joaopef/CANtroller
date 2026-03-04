@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QToolBar, QStatusBar, QLabel,
     QComboBox, QPushButton, QGroupBox, QHeaderView, QMessageBox,
     QMenu, QMenuBar, QTabWidget, QFileDialog, QApplication,
-    QProgressBar, QGridLayout, QCheckBox
+    QProgressBar, QGridLayout, QCheckBox, QLineEdit, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
@@ -403,6 +403,12 @@ class MainWindow(QMainWindow):
         self.sim_gear_label = QLabel("---")
         self.sim_gear_label.setStyleSheet("color: #90caf9; font-weight: bold; font-size: 13px;")
         live_grid.addWidget(self.sim_gear_label, 1, 5)
+        
+        # Row 2: Temperature data
+        live_grid.addWidget(QLabel("🌡️ Temperature:"), 2, 0)
+        self.sim_temp_label = QLabel("---")
+        self.sim_temp_label.setStyleSheet("color: #ef9a9a; font-weight: bold; font-size: 13px;")
+        live_grid.addWidget(self.sim_temp_label, 2, 1)
         
         sim_layout.addWidget(live_data_group)
         
@@ -1485,6 +1491,8 @@ class MainWindow(QMainWindow):
         self.sim_speed_label.setText(f"{data['speed']} km/h")
         self.sim_mileage_label.setText(f"{data['mileage']:.1f} km")
         self.sim_gear_label.setText(f"{data['gear']}")
+        if 'temperature' in data:
+            self.sim_temp_label.setText(f"{data['temperature']:.1f} °C")
     
     def _on_sim_finished(self):
         """Handle simulation finished"""
@@ -1502,6 +1510,7 @@ class MainWindow(QMainWindow):
         self.sim_speed_label.setText("---")
         self.sim_mileage_label.setText("---")
         self.sim_gear_label.setText("---")
+        self.sim_temp_label.setText("---")
     
     def _on_sim_status(self, msg: str):
         """Handle simulation status message"""

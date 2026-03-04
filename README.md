@@ -20,8 +20,9 @@
 - 🏍️ **EV Simulation Engine** — Full battery/motor simulation with realistic BMS and MCU CAN frames
 - 📈 **Trip Profiles** — Pre-built city, highway, and charge profiles
 - 📂 **CSV Trip Import** — Import real driving data from CSV files with auto-detection of columns
-- 🔋 **Realistic Battery Model** — 72V NMC 20S pack, 73Ah capacity, regenerative braking
-- ⚡ **Live Data Display** — Real-time voltage, current, SOC, speed, mileage, and gear
+- 🔋 **PyBaMM Battery Model** — Physics-based SPM with lumped thermal model, 72V NMC 20S pack, 40Ah capacity
+- 🌡️ **Temperature Simulation** — Cell temperature via electrochemical model, transmitted over CAN (0x18F82880)
+- ⚡ **Live Data Display** — Real-time voltage, current, SOC, speed, mileage, gear, and temperature
 
 ### Interface
 - 🔢 **3-Mode Data Display** — Toggle between HEX, Decimal, and Decoded views
@@ -83,8 +84,8 @@ For Windows users, download the pre-built executable from the [Releases](https:/
 
 1. Switch to the **Simulation** tab
 2. Select a pre-built profile (City, Highway, Charge) or import a CSV trip file
-3. Click **Start** — the simulator sends BMS and MCU CAN frames
-4. Monitor live data: voltage, current, SOC, speed, mileage, and gear
+3. Click **Start** — the simulator sends BMS SOC, MCU, and BMS Temperature CAN frames
+4. Monitor live data: voltage, current, SOC, speed, mileage, gear, and temperature
 5. Adjust playback speed with the slider
 
 ### Signal Decoding
@@ -149,7 +150,8 @@ CANtroller/
 │   ├── main_window.py       # Main GUI orchestrator (~1370 lines)
 │   ├── can_manager.py       # CAN communication + RX buffer (~330 lines)
 │   ├── config_manager.py    # Save/Load/Import/Export (~300 lines)
-│   ├── simulator.py         # EV simulation engine (~770 lines)
+│   ├── simulator.py         # EV simulation engine (~830 lines)
+│   ├── battery_model.py     # PyBaMM SPM + thermal model (~140 lines)
 │   ├── widgets/             # Custom widgets
 │   │   └── hex_inputs.py    # HexDataLineEdit, HexByteLineEdit
 │   └── dialogs/             # Dialog windows
