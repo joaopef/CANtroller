@@ -781,6 +781,11 @@ class MainWindow(QMainWindow):
             self.transmit_count[msg_id] += 1
         else:
             self.transmit_count[msg_id] = 1
+        
+        # Also add to receive table so sent frames are visible in the monitor
+        # (PCAN loopback may not reliably return all sent frames)
+        self._on_message_received_internal(msg)
+        
         self._update_periodic_table()
         self._update_rules_table()
     
