@@ -667,13 +667,12 @@ def encode_bms_temp_frame(dp: TripDataPoint) -> List[int]:
     """
     Encode BMS temperature data into 8 CAN bytes for BMS_TEMP (0x18F82880).
 
-    Layout:
-      Byte 0: Mean Temp (8-bit, offset -40°C, 1°C/bit)
-      Byte 1: Max Temp (8-bit, offset -40°C, 1°C/bit)
-      Byte 2: Max Cell Nr (1-20)
-      Byte 3: Min Temp (8-bit, offset -40°C, 1°C/bit)
-      Byte 4: Min Cell Nr (1-20)
-      Byte 5-7: Reserved (0x00)
+    Layout (BIG-ENDIAN):
+      Byte 0-1: Mean Temp (16-bit, offset -40°C, 1°C/bit)
+      Byte 2-3: Max Temp (16-bit, offset -40°C, 1°C/bit)
+      Byte 4: Max Cell Nr (8-bit, 1-20)
+      Byte 5-6: Min Temp (16-bit, offset -40°C, 1°C/bit)
+      Byte 7: Min Cell Nr (8-bit, 1-20)
     """
     avg_temp = dp.temperature_C
     temp_max = avg_temp + random.uniform(0.5, 2.0)
@@ -683,23 +682,22 @@ def encode_bms_temp_frame(dp: TripDataPoint) -> List[int]:
     max_cell = random.choice([5, 8, 12, 18])
     min_cell = random.choice([1, 2, 19, 20])
 
-    # Convert to 8-bit with -40°C offset
+    # Convert to 16-bit with -40°C offset, factor 1
     avg_raw = int(round(avg_temp)) + 40
     max_raw = int(round(temp_max)) + 40
     min_raw = int(round(temp_min)) + 40
 
-    # Clamp to 8-bit unsigned range (0-255)
-    avg_raw = max(0, min(avg_raw, 255))
-    max_raw = max(0, min(max_raw, 255))
-    min_raw = max(0, min(min_raw, 255))
+    # Clamp to 16-bit unsigned range
+    avg_raw = max(0, min(avg_raw, 0xFFFF))
+    max_raw = max(0, min(max_raw, 0xFFFF))
+    min_raw = max(0, min(min_raw, 0xFFFF))
 
     data = [
-        avg_raw,       # Byte 0: Mean
-        max_raw,       # Byte 1: Max Temp
-        max_cell,      # Byte 2: Max Cell Nr
-        min_raw,       # Byte 3: Min Temp
-        min_cell,      # Byte 4: Min Cell Nr
-        0x00, 0x00, 0x00  # Byte 5-7: Reserved
+        (avg_raw >> 8) & 0xFF, avg_raw & 0xFF,       # Byte 0-1: Mean
+        (max_raw >> 8) & 0xFF, max_raw & 0xFF,       # Byte 2-3: Max Temp
+        max_cell,                                    # Byte 4: Max Cell Nr
+        (min_raw >> 8) & 0xFF, min_raw & 0xFF,       # Byte 5-6: Min Temp
+        min_cell,                                    # Byte 7: Min Cell Nr
     ]
     return data
 
