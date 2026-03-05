@@ -667,32 +667,39 @@ def encode_bms_temp_frame(dp: TripDataPoint) -> List[int]:
     """
     Encode BMS temperature data into 8 CAN bytes for BMS_TEMP (0x18F82880).
 
-    Layout (BIG-ENDIAN):
-      Byte 0-1: Cell Temp Average (16-bit, factor 0.1°C, big-endian)
-      Byte 2-3: Cell Temp Max (16-bit, factor 0.1°C, big-endian)
-      Byte 4-5: Cell Temp Min (16-bit, factor 0.1°C, big-endian)
-      Byte 6-7: Reserved (0x00)
+    Layout:
+      Byte 0: Mean Temp (8-bit, offset -40°C, 1°C/bit)
+      Byte 1: Max Temp (8-bit, offset -40°C, 1°C/bit)
+      Byte 2: Max Cell Nr (1-20)
+      Byte 3: Min Temp (8-bit, offset -40°C, 1°C/bit)
+      Byte 4: Min Cell Nr (1-20)
+      Byte 5-7: Reserved (0x00)
     """
     avg_temp = dp.temperature_C
-    # Simulate small variation for max/min around the average
     temp_max = avg_temp + random.uniform(0.5, 2.0)
     temp_min = avg_temp - random.uniform(0.5, 2.0)
 
-    # Convert to raw values (factor 0.1°C)
-    avg_raw = int(round(avg_temp / 0.1))
-    max_raw = int(round(temp_max / 0.1))
-    min_raw = int(round(temp_min / 0.1))
+    # Assign arbitrary, non-overlapping cell numbers (1 to 20) for realism
+    max_cell = random.choice([5, 8, 12, 18])
+    min_cell = random.choice([1, 2, 19, 20])
 
-    # Clamp to 16-bit unsigned range
-    avg_raw = max(0, min(avg_raw, 0xFFFF))
-    max_raw = max(0, min(max_raw, 0xFFFF))
-    min_raw = max(0, min(min_raw, 0xFFFF))
+    # Convert to 8-bit with -40°C offset
+    avg_raw = int(round(avg_temp)) + 40
+    max_raw = int(round(temp_max)) + 40
+    min_raw = int(round(temp_min)) + 40
+
+    # Clamp to 8-bit unsigned range (0-255)
+    avg_raw = max(0, min(avg_raw, 255))
+    max_raw = max(0, min(max_raw, 255))
+    min_raw = max(0, min(min_raw, 255))
 
     data = [
-        (avg_raw >> 8) & 0xFF, avg_raw & 0xFF,     # Avg temp BE
-        (max_raw >> 8) & 0xFF, max_raw & 0xFF,     # Max temp BE
-        (min_raw >> 8) & 0xFF, min_raw & 0xFF,     # Min temp BE
-        0x00, 0x00,                                  # Reserved
+        avg_raw,       # Byte 0: Mean
+        max_raw,       # Byte 1: Max Temp
+        max_cell,      # Byte 2: Max Cell Nr
+        min_raw,       # Byte 3: Min Temp
+        min_cell,      # Byte 4: Min Cell Nr
+        0x00, 0x00, 0x00  # Byte 5-7: Reserved
     ]
     return data
 
