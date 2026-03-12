@@ -219,6 +219,13 @@ def main():
     log = logging.getLogger('cantroller')
     log.info('CANtroller starting…')
 
+    # Windows: register app ID so the taskbar shows our icon instead of python.exe's
+    if sys.platform == 'win32':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            'utad.cantroller.1'
+        )
+
     app = QApplication(sys.argv)
     
     # Apply dark theme
