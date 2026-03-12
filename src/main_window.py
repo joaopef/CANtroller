@@ -124,6 +124,7 @@ class MainWindow(QMainWindow):
         self.can_manager._labeled_logger = self.labeled_logger
         self._current_attack = None
         self._dataset_collector = DatasetCollector(self.can_manager, self.labeled_logger)
+        self._dataset_collector.set_sim_engine(self.sim_engine)
         self._dataset_collector.status_changed.connect(self._atk_on_status)
         self._dataset_collector.collection_finished.connect(self._atk_on_collection_done)
     
@@ -2097,6 +2098,14 @@ class MainWindow(QMainWindow):
                 sim_engine=self.sim_engine, drift_byte=4, duration_s=0),
         }
 
+        profile_factories = {
+            'sim:city': lambda: TripProfileGenerator.generate_city_trip(duration_min=30),
+            'sim:highway': lambda: TripProfileGenerator.generate_highway_trip(duration_min=30),
+            'sim:charge': lambda: TripProfileGenerator.generate_charge_cycle(duration_min=30),
+            'sim:wmtc_p1': lambda: TripProfileGenerator.generate_wmtc_class1(parts=[1]),
+            'sim:wmtc_p1p2': lambda: TripProfileGenerator.generate_wmtc_class1(parts=[1, 2]),
+        }
+
         steps = []
         for _ in range(repeats):
             for raw in raw_steps:
@@ -2108,6 +2117,10 @@ class MainWindow(QMainWindow):
                     steps.append(CollectionStep(
                         phase=stype, duration_s=dur,
                         attack_factory=attack_factories[stype]))
+                elif stype in profile_factories:
+                    steps.append(CollectionStep(
+                        phase=stype, duration_s=dur,
+                        profile_factory=profile_factories[stype]))
 
         self._dataset_collector.set_metadata({
             'scenario_steps': raw_steps,

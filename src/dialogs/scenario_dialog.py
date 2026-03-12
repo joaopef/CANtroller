@@ -34,6 +34,11 @@ STEP_TYPES = [
     "masquerade",
     "suspension",
     "pause",
+    "sim:city",
+    "sim:highway",
+    "sim:charge",
+    "sim:wmtc_p1",
+    "sim:wmtc_p1p2",
 ]
 
 DEFAULT_DURATIONS = {
@@ -45,6 +50,11 @@ DEFAULT_DURATIONS = {
     "masquerade": 45,
     "suspension": 30,
     "pause": 10,
+    "sim:city": 600,
+    "sim:highway": 600,
+    "sim:charge": 600,
+    "sim:wmtc_p1": 600,
+    "sim:wmtc_p1p2": 1200,
 }
 
 

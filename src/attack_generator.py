@@ -563,10 +563,11 @@ class SuspensionAttack(BaseAttack):
 @dataclass
 class CollectionStep:
     """One step in a dataset collection sequence."""
-    phase: str          # "normal" or attack label
+    phase: str          # "normal", attack label, or "sim:profile_name"
     duration_s: float
     attack_factory: Optional[Callable] = None   # callable() → BaseAttack
     subtype: str = ""
+    profile_factory: Optional[Callable] = None  # callable() → TripProfile (for sim: steps)
 
 
 class DatasetCollector(QObject):
@@ -591,6 +592,11 @@ class DatasetCollector(QObject):
         self._current_attack: Optional[BaseAttack] = None
         self._thread: Optional[threading.Thread] = None
         self._metadata: Dict = {}
+        self._sim_engine = None  # Set via set_sim_engine()
+
+    def set_sim_engine(self, sim_engine):
+        """Provide a reference to the SimulationEngine for profile switching."""
+        self._sim_engine = sim_engine
 
     @property
     def is_running(self) -> bool:
@@ -652,20 +658,27 @@ class DatasetCollector(QObject):
     def _run_sequence(self):
         total = len(self._steps)
         log.info('Dataset collection started — %d steps', total)
+        sim_was_running = self._sim_engine and self._sim_engine.is_running
         for i, step in enumerate(self._steps):
             if not self._running:
                 break
             self.step_changed.emit(i + 1, total, f"{step.phase}: {step.duration_s}s")
 
-            # Set the label for this phase so RX frames are also labeled correctly
-            self._logger.set_label(step.phase, step.subtype)
-
-            if step.phase == "normal":
+            if step.phase.startswith("sim:"):
+                # Simulation profile step: label frames as normal, switch simulator
+                self._logger.set_label("normal", step.phase)
+                self._start_sim_profile(step)
                 self.status_changed.emit(
-                    f"[{i+1}/{total}] Normal traffic — {step.duration_s}s")
+                    f"[{i+1}/{total}] {step.phase} — {step.duration_s}s")
+                self._wait(step.duration_s)
+            elif step.phase == "normal":
+                self._logger.set_label(step.phase, step.subtype)
+                self.status_changed.emit(
+                    f"[{i+1}/{total}] Normal traffic \u2014 {step.duration_s}s")
                 self._wait(step.duration_s)
             else:
                 # Start the attack
+                self._logger.set_label(step.phase, step.subtype)
                 if step.attack_factory:
                     attack = step.attack_factory()
                     self._current_attack = attack
@@ -676,6 +689,10 @@ class DatasetCollector(QObject):
                     attack.stop()
                     self._current_attack = None
 
+        # If the simulator wasn't running before we started, stop it now
+        if not sim_was_running and self._sim_engine and self._sim_engine.is_running:
+            self._sim_engine.stop()
+
         self._running = False
         self._logger.reset_label()
         self._logger.stop()
@@ -684,6 +701,16 @@ class DatasetCollector(QObject):
         self.collection_finished.emit(filepath)
         log.info('Dataset collection complete: %s (%d frames)', filepath, self._logger.total_count)
         self.status_changed.emit(f"Dataset collection complete: {filepath}")
+
+    def _start_sim_profile(self, step: CollectionStep):
+        """Load and start a simulation profile for a sim: step."""
+        if not self._sim_engine:
+            log.warning('No sim_engine set — cannot run sim: step')
+            return
+        if step.profile_factory:
+            profile = step.profile_factory()
+            self._sim_engine.load_profile(profile)
+            self._sim_engine.start()
 
     def _wait(self, seconds: float):
         """Wait in small increments so we can be interrupted."""
