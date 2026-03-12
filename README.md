@@ -1,7 +1,7 @@
 # CANtroller
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="CANtroller Screenshot" width="800">
+  <img src="https://github.com/user-attachments/assets/95f2743a-0939-46af-8e17-be13e1cbadc2" alt="CANtroller GIF" width="800">
 </p>
 
 **CANtroller** is an intelligent CAN bus monitoring, simulation, and fault injection tool for electric vehicle development and IDS dataset generation. Built with Python and PyQt6, it provides a professional interface similar to PCAN-View with added intelligent features like auto-response, signal decoding, a full EV simulation engine, and a complete attack generator for CAN bus security research.
