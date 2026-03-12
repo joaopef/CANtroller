@@ -4,7 +4,7 @@
   <img src="docs/screenshot.png" alt="CANtroller Screenshot" width="800">
 </p>
 
-**CANtroller** is an intelligent CAN bus monitoring, control, and simulation tool for electric vehicle development. Built with Python and PyQt6, it provides a professional interface similar to PCAN-View with added intelligent features like auto-response, signal decoding, and a full EV simulation engine.
+**CANtroller** is an intelligent CAN bus monitoring, simulation, and fault injection tool for electric vehicle development and IDS dataset generation. Built with Python and PyQt6, it provides a professional interface similar to PCAN-View with added intelligent features like auto-response, signal decoding, a full EV simulation engine, and a complete attack generator for CAN bus security research.
 
 ## ✨ Features
 
@@ -12,24 +12,37 @@
 - 🔍 **Real-time CAN Monitoring** — View all CAN messages with ID, data, cycle time, and count
 - 📧 **Periodic Message Transmission** — Send messages at configurable intervals
 - 🔄 **Intelligent Auto-Response** — Automatically respond to specific CAN IDs with custom data
-- 🔢 **Byte Increment Counter** — Auto-increment a chosen byte in periodic messages or responses for manual testing
+- 🔢 **Byte Increment Counter** — Auto-increment a chosen byte in periodic messages or responses
 - 📊 **Signal Decoding** — Decode CAN data into readable values (Speed:20km/h, Voltage:100V)
 - 📥 **CSV Import** — Import CAN IDs and signal definitions from CSV files
+- 📈 **Bus Load Indicator** — Real-time bus utilisation percentage and frames/s in the status bar
 
 ### Simulation
 - 🏍️ **EV Simulation Engine** — Full battery/motor simulation with realistic BMS and MCU CAN frames
-- 📈 **Trip Profiles** — Pre-built city, highway, and charge profiles
+- 📈 **Trip Profiles** — Pre-built city, highway, WMTC, and charge profiles
 - 📂 **CSV Trip Import** — Import real driving data from CSV files with auto-detection of columns
 - 🔋 **PyBaMM Battery Model** — Physics-based SPM with lumped thermal model, 72V NMC 20S pack, 40Ah capacity
 - 🌡️ **Temperature Simulation** — Cell temperature via electrochemical model, transmitted over CAN (0x18F82880)
 - ⚡ **Live Data Display** — Real-time voltage, current, SOC, speed, mileage, gear, and temperature
+
+### Attack Generator & Dataset Collection
+- 💥 **DoS Attack** — Bus flooding with high-priority frames at configurable rate
+- 💉 **Injection Attack** — Forge frames with manipulated payloads on known CAN IDs
+- 🎲 **Fuzzing Attack** — Random CAN IDs and payloads (standard, extended, or both)
+- 🔁 **Replay Attack** — Record → delay → replay captured traffic
+- 🎭 **Masquerade Attack** — Learn ECU timing, suppress real ECU, impersonate with drifted payload
+- 🚫 **Suspension Attack** — Suppress specific CAN IDs from the simulator
+- 📊 **Dataset Collector** — Automated normal→attack→normal sequences with configurable per-attack durations and rounds, producing labeled CSVs + JSON metadata sidecars
+- 📋 **Scenario Builder** — Design custom test sequences with drag-and-drop steps, save/load JSON scenarios, repeat N times
+- 📝 **Labeled Logger** — Thread-safe CSV logger tagging every frame with ground-truth labels for IDS training
 
 ### Interface
 - 🔢 **3-Mode Data Display** — Toggle between HEX, Decimal, and Decoded views
 - 🎨 **Modern Dark Theme** — Professional and eye-friendly interface
 - 💾 **Save/Load Configuration** — Persist messages and rules in `.cantroller` files
 - 🔎 **Message Filtering** — Quick filter by CAN ID
-- 📊 **Detailed Status Bar** — RX/TX counts, error tracking, connection status
+- 📊 **Detailed Status Bar** — RX/TX counts, error tracking, bus load, connection status
+- 📋 **Python Logging** — Application log file (`cantroller.log`) for debugging
 
 ## 🚀 Quick Start
 
@@ -88,6 +101,30 @@ For Windows users, download the pre-built executable from the [Releases](https:/
 4. Monitor live data: voltage, current, SOC, speed, mileage, gear, and temperature
 5. Adjust playback speed with the slider
 
+### Attack Generator
+
+1. Switch to the **Attack Generator** tab
+2. Select an attack type (DoS, Injection, Fuzzing, Replay, Masquerade, Suspension)
+3. Configure Target ID, Duration, Rate, Payload as needed
+4. Click **Start Attack** — the attack runs alongside the simulation
+5. Monitor attack frames count, logger RX/TX counters, and bus load in the status bar
+6. Click **Stop Attack** to end
+
+### Dataset Collection
+
+1. In the Attack Generator tab, click **Collect Dataset**
+2. Configure normal traffic duration, number of rounds, and enable/disable each attack type
+3. Choose an output CSV file — the collector runs an automated normal→attack→normal sequence
+4. A JSON metadata sidecar is saved alongside the CSV with collection parameters and frame counts
+
+### Scenario Builder
+
+1. Click **Run Scenario…** to open the Scenario Builder dialog
+2. Add steps: normal, dos, injection, fuzzing, replay, masquerade, suspension, or pause
+3. Set duration and notes per step, reorder with Move Up/Down
+4. Set repeat count (1–100×), save/load scenarios as JSON
+5. Click **▶ Run Scenario** — a labeled CSV dataset is produced automatically
+
 ### Signal Decoding
 
 1. Go to **File → Import → Import CAN Blocks** and select your CSV file
@@ -118,51 +155,67 @@ CAN ID,CAN Data Point,Signal name,Bit start,Bit length,Factor,Unit
 ## 🏗️ Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                       CANtroller                             │
-├──────────────────────────────────────────────────────────────┤
-│  ┌──────────┐   ┌──────────────┐   ┌─────────────┐          │
-│  │ main.py  │──▶│ main_window  │◀──│ can_manager  │          │
-│  │ (Entry)  │   │    (GUI)     │   │   (CAN I/O)  │          │
-│  └──────────┘   └──────┬───────┘   └──────┬──────┘          │
-│                        │                   │                 │
-│           ┌────────────┼────────────┐      │                 │
-│           ▼            ▼            ▼      ▼                 │
-│    ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌───────────┐    │
-│    │ widgets/ │ │ dialogs/ │ │config_mgr │ │python-can │    │
-│    │(hex edit)│ │(rule/msg)│ │(save/load)│ └─────┬─────┘    │
-│    └──────────┘ └──────────┘ └───────────┘       │          │
-│                 ┌──────────────┐                  ▼          │
-│                 │  simulator   │           ┌───────────┐     │
-│                 │  (EV Sim)    │           │ PCAN-USB  │     │
-│                 └──────────────┘           └───────────┘     │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                          CANtroller                              │
+├──────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐   ┌──────────────┐   ┌─────────────┐              │
+│  │ main.py  │──▶│ main_window  │◀──│ can_manager  │◀── PCAN-USB │
+│  │ (Entry)  │   │    (GUI)     │   │   (CAN I/O)  │              │
+│  └──────────┘   └──────┬───────┘   └──────────────┘              │
+│                        │                                         │
+│       ┌────────────────┼────────────────────┐                    │
+│       ▼                ▼                    ▼                    │
+│ ┌───────────┐  ┌──────────────┐  ┌───────────────────┐          │
+│ │ simulator │  │  dialogs/    │  │ attack_generator   │          │
+│ │  (EV Sim) │  │ widgets/     │  │  6 attack types    │          │
+│ └───────────┘  │ config_mgr   │  │  DatasetCollector  │          │
+│                └──────────────┘  │  ScenarioBuilder   │          │
+│                                  └────────┬──────────┘          │
+│                                           ▼                      │
+│                                  ┌───────────────────┐          │
+│                                  │  labeled_logger    │          │
+│                                  │  (CSV + metadata)  │          │
+│                                  └───────────────────┘          │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## 📁 Project Structure
 
 ```
 CANtroller/
-├── docs/                    # Documentation
-│   └── architecture.md      # Architecture details
-├── src/                     # Source code
-│   ├── main.py              # Entry point + dark theme
-│   ├── main_window.py       # Main GUI orchestrator (~1370 lines)
-│   ├── can_manager.py       # CAN communication + RX buffer (~330 lines)
-│   ├── config_manager.py    # Save/Load/Import/Export (~300 lines)
-│   ├── simulator.py         # EV simulation engine (~830 lines)
-│   ├── battery_model.py     # PyBaMM SPM + thermal model (~140 lines)
-│   ├── widgets/             # Custom widgets
-│   │   └── hex_inputs.py    # HexDataLineEdit, HexByteLineEdit
-│   └── dialogs/             # Dialog windows
-│       ├── rule_dialog.py   # AddRuleDialog
-│       └── transmit_dialog.py # NewTransmitMessageDialog
-├── improvements.md          # Future roadmap & implemented changes
-├── .gitignore
-├── LICENSE                  # MIT License
-├── README.md
-├── requirements.txt         # Python dependencies
-└── CANtroller.spec          # PyInstaller configuration
+├── data/                        # Sample CAN data files
+│   ├── CAN Blocks.csv           #   CAN ID definitions
+│   ├── CAN Data Points.csv      #   Signal definitions
+│   └── Data reading Teste conducao.csv
+├── docs/                        # Documentation
+│   ├── architecture.md
+│   └── screenshot.png
+├── src/                         # Source code
+│   ├── main.py                  # Entry point + logging setup
+│   ├── main_window.py           # Main GUI orchestrator
+│   ├── can_manager.py           # CAN communication + RX buffer + RX taps
+│   ├── config_manager.py        # Save/Load/Import/Export
+│   ├── simulator.py             # EV simulation engine + trip profiles
+│   ├── battery_model.py         # PyBaMM SPM + thermal model
+│   ├── attack_generator.py      # 6 attack types + DatasetCollector
+│   ├── labeled_logger.py        # Thread-safe labeled CSV logger
+│   ├── widgets/                 # Custom widgets
+│   │   └── hex_inputs.py
+│   └── dialogs/                 # Dialog windows
+│       ├── rule_dialog.py       #   Auto-response rule editor
+│       ├── transmit_dialog.py   #   Periodic message editor
+│       ├── collection_dialog.py #   Dataset collection config
+│       └── scenario_dialog.py   #   Scenario builder
+├── tests/                       # Pytest unit tests
+│   ├── test_simulator.py        #   27 tests — frame encoding + trip profiles
+│   ├── test_labeled_logger.py   #   10 tests — CSV logger correctness
+│   └── test_validation.py       #   7 tests — dialog defaults + JSON roundtrip
+├── pytest.ini                   # Pytest configuration
+├── requirements.txt             # Python dependencies
+├── CANtroller.spec              # PyInstaller build configuration
+├── improvements.md              # Improvement roadmap
+├── LICENSE                      # MIT License
+└── README.md
 ```
 
 ## 🛠️ Building Executable
@@ -175,6 +228,13 @@ pip install pyinstaller
 pyinstaller CANtroller.spec
 
 # The executable will be in dist/CANtroller.exe
+```
+
+## 🧪 Running Tests
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
 ```
 
 ## 📋 Configuration File Format

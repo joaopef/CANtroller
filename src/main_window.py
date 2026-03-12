@@ -1,12 +1,15 @@
-﻿"""
+"""
 Main Window - CANtroller application interface
 """
+import logging
 import time
 import json
 import os
 import sys
 from datetime import datetime
 from typing import Dict, Optional, List
+
+log = logging.getLogger('cantroller.main_window')
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTableWidget, QTableWidgetItem, QToolBar, QStatusBar, QLabel,
@@ -15,15 +18,22 @@ from PyQt6.QtWidgets import (
     QProgressBar, QGridLayout, QCheckBox, QLineEdit, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent
 import can
 
 from can_manager import CANManager, ResponseRule, TransmitMessage
 from simulator import SimulationEngine, TripProfileGenerator
 from config_manager import ConfigManager
+from labeled_logger import LabeledLogger
+from attack_generator import (
+    DoSAttack, InjectionAttack, FuzzAttack, ReplayAttack,
+    MasqueradeAttack, SuspensionAttack, DatasetCollector, CollectionStep
+)
 from widgets.hex_inputs import HexDataLineEdit, HexByteLineEdit
 from dialogs.rule_dialog import AddRuleDialog
 from dialogs.transmit_dialog import NewTransmitMessageDialog
+from dialogs.collection_dialog import CollectionConfigDialog
+from dialogs.scenario_dialog import ScenarioBuilderDialog
 
 # Settings file path - use app directory for PyInstaller compatibility
 def get_settings_path():
@@ -108,6 +118,14 @@ class MainWindow(QMainWindow):
         self.sim_engine.simulation_finished.connect(self._on_sim_finished)
         self.sim_engine.simulation_started.connect(self._on_sim_started)
         self.sim_engine.status_message.connect(self._on_sim_status)
+        
+        # Labeled logger + attack generator state
+        self.labeled_logger = LabeledLogger()
+        self.can_manager._labeled_logger = self.labeled_logger
+        self._current_attack = None
+        self._dataset_collector = DatasetCollector(self.can_manager, self.labeled_logger)
+        self._dataset_collector.status_changed.connect(self._atk_on_status)
+        self._dataset_collector.collection_finished.connect(self._atk_on_collection_done)
     
     # === Property delegators to ConfigManager ===
     @property
@@ -414,6 +432,9 @@ class MainWindow(QMainWindow):
         
         self.transmit_tabs.addTab(sim_widget, "🔄 Simulation")
         
+        # --- Tab 4: Attack Generator ---
+        self._setup_attack_tab()
+        
         transmit_layout.addWidget(self.transmit_tabs)
         splitter.addWidget(transmit_group)
         
@@ -613,6 +634,11 @@ class MainWindow(QMainWindow):
         # Errors
         self.errors_label = QLabel("Errors: 0")
         self.statusbar.addPermanentWidget(self.errors_label)
+
+        # Bus Load
+        self.bus_load_label = QLabel("Bus: 0%")
+        self.bus_load_label.setToolTip("Estimated CAN bus load (frames/s vs theoretical max)")
+        self.statusbar.addPermanentWidget(self.bus_load_label)
         
         # Status indicator
         self.status_indicator = QLabel("●")
@@ -620,9 +646,37 @@ class MainWindow(QMainWindow):
         self.statusbar.addPermanentWidget(self.status_indicator)
     
     def _update_status_bar(self):
-        """Update status bar with current counts"""
+        """Update status bar with current counts and bus load."""
         self.rx_label.setText(f"RX: {self.local_rx_count}")
         self.tx_label.setText(f"TX: {self.local_tx_count}")
+
+        # Bus load calculation
+        now = time.monotonic()
+        prev_time = getattr(self, '_busload_prev_time', now)
+        prev_rx = getattr(self, '_busload_prev_rx', 0)
+        prev_tx = getattr(self, '_busload_prev_tx', 0)
+        dt = now - prev_time
+        if dt >= 1.0 and self.can_manager.is_connected:
+            frames = (self.local_rx_count - prev_rx) + (self.local_tx_count - prev_tx)
+            fps = frames / dt
+            # Theoretical max for CAN 2.0B extended 8-byte frame @ configured bitrate
+            # Worst-case frame: 67 base bits + ~23 stuff bits ≈ 114 bits
+            bitrate = self.can_manager._bitrate or 500000
+            max_fps = bitrate / 114.0
+            load_pct = min(100.0, (fps / max_fps) * 100.0) if max_fps > 0 else 0
+            self.bus_load_label.setText(f"Bus: {load_pct:.0f}% ({fps:.0f} fps)")
+            if load_pct > 80:
+                self.bus_load_label.setStyleSheet("color: #ff6b6b; font-weight: bold;")
+            elif load_pct > 50:
+                self.bus_load_label.setStyleSheet("color: #ffb74d;")
+            else:
+                self.bus_load_label.setStyleSheet("")
+            self._busload_prev_time = now
+            self._busload_prev_rx = self.local_rx_count
+            self._busload_prev_tx = self.local_tx_count
+        elif not self.can_manager.is_connected:
+            self.bus_load_label.setText("Bus: ---")
+            self.bus_load_label.setStyleSheet("")
     
     def _toggle_connection(self):
         """Toggle CAN connection"""
@@ -995,9 +1049,9 @@ class MainWindow(QMainWindow):
                 if dialog.exec() == QDialog.DialogCode.Accepted:
                     new_msg = dialog.get_validated_message()
                     if new_msg:
-                        # Remove old and add new
+                        # Replace in-place: remove old, insert at same position
                         self.can_manager.remove_transmit_message(row)
-                        self.can_manager.add_transmit_message(new_msg)
+                        self.can_manager.insert_transmit_message(row, new_msg)
                         self._update_periodic_table()
     
     def _delete_transmit_message(self):
@@ -1080,11 +1134,33 @@ class MainWindow(QMainWindow):
             self.errors_label.setStyleSheet("")
     
     def _on_error(self, error_msg: str):
-        """Handle error messages"""
+        """Handle error messages — rate-limited to avoid dialog floods."""
+        import time
+        now = time.monotonic()
+        if now - getattr(self, '_last_error_time', 0) < 2.0:
+            return
+        self._last_error_time = now
         QMessageBox.warning(self, "Error", error_msg)
     
     def closeEvent(self, event):
-        """Handle window close"""
+        """Handle window close — stop all running subsystems."""
+        # Stop active attack
+        if self._current_attack and self._current_attack.is_running:
+            self._current_attack.stop()
+        # Stop dataset collector
+        if self._dataset_collector.is_running:
+            self._dataset_collector.stop()
+        # Stop simulation
+        if self.sim_engine.is_running:
+            self.sim_engine.stop()
+        # Stop labeled logger
+        if self.labeled_logger.is_running:
+            self.labeled_logger.stop()
+        # Stop GUI timers
+        self.update_timer.stop()
+        self.rx_timer.stop()
+        self.status_timer.stop()
+        # Disconnect CAN bus
         if self.can_manager.is_connected:
             self.can_manager.disconnect()
         event.accept()
@@ -1520,4 +1596,527 @@ class MainWindow(QMainWindow):
     def _on_sim_status(self, msg: str):
         """Handle simulation status message"""
         self.status_label.setText(msg)
+
+    # ═══════════════════════════════════════════════════════════
+    #  Attack Generator Tab
+    # ═══════════════════════════════════════════════════════════
+
+    def _setup_attack_tab(self):
+        """Build the Attack Generator tab UI."""
+        atk_widget = QWidget()
+        atk_layout = QVBoxLayout(atk_widget)
+        atk_layout.setContentsMargins(5, 5, 5, 5)
+
+        # ── Row 1: Attack type selector + parameters ──
+        top_row = QHBoxLayout()
+
+        top_row.addWidget(QLabel("Attack:"))
+        self.atk_type_combo = QComboBox()
+        self.atk_type_combo.addItems([
+            "DoS — Bus Flooding",
+            "Injection — Forged Frames",
+            "Fuzzing — Random Traffic",
+            "Replay — Record & Retransmit",
+            "Masquerade — Suppress + Impersonate",
+            "Suspension — Message Absence",
+        ])
+        self.atk_type_combo.setMinimumWidth(220)
+        self.atk_type_combo.currentIndexChanged.connect(self._on_attack_type_changed)
+        top_row.addWidget(self.atk_type_combo)
+
+        top_row.addWidget(QLabel("  Target ID:"))
+        self.atk_target_id_edit = QLineEdit("18F81280")
+        self.atk_target_id_edit.setMaximumWidth(120)
+        self.atk_target_id_edit.setPlaceholderText("Hex CAN ID")
+        top_row.addWidget(self.atk_target_id_edit)
+
+        top_row.addWidget(QLabel("  Duration (s):"))
+        self.atk_duration_edit = QLineEdit("30")
+        self.atk_duration_edit.setMaximumWidth(60)
+        top_row.addWidget(self.atk_duration_edit)
+
+        top_row.addWidget(QLabel("  Rate (ms):"))
+        self.atk_rate_edit = QLineEdit("100")
+        self.atk_rate_edit.setMaximumWidth(60)
+        top_row.addWidget(self.atk_rate_edit)
+
+        top_row.addStretch()
+        atk_layout.addLayout(top_row)
+
+        # ── Row 2: Payload + extra parameters ──
+        param_row = QHBoxLayout()
+
+        param_row.addWidget(QLabel("Payload (hex):"))
+        self.atk_payload_edit = QLineEdit("03 48 00 00 64 64 00 0A")
+        self.atk_payload_edit.setMinimumWidth(220)
+        self.atk_payload_edit.setPlaceholderText("e.g. 03 48 00 00 64 64 00 0A")
+        param_row.addWidget(self.atk_payload_edit)
+
+        param_row.addWidget(QLabel("  Subtype:"))
+        self.atk_subtype_edit = QLineEdit("")
+        self.atk_subtype_edit.setMaximumWidth(150)
+        self.atk_subtype_edit.setPlaceholderText("e.g. soc_spoof_full")
+        param_row.addWidget(self.atk_subtype_edit)
+
+        param_row.addWidget(QLabel("  ID mode:"))
+        self.atk_id_mode_combo = QComboBox()
+        self.atk_id_mode_combo.addItems(["standard", "extended", "both"])
+        self.atk_id_mode_combo.setMaximumWidth(100)
+        param_row.addWidget(self.atk_id_mode_combo)
+
+        param_row.addWidget(QLabel("  Drift byte:"))
+        self.atk_drift_byte_edit = QLineEdit("4")
+        self.atk_drift_byte_edit.setMaximumWidth(30)
+        param_row.addWidget(self.atk_drift_byte_edit)
+
+        param_row.addStretch()
+        atk_layout.addLayout(param_row)
+
+        # ── Row 3: Controls ──
+        ctrl_row = QHBoxLayout()
+
+        self.atk_start_btn = QPushButton("⚡ Start Attack")
+        self.atk_start_btn.setStyleSheet(
+            "QPushButton { background-color: #e65100; padding: 6px 18px; "
+            "font-weight: bold; color: white; } "
+            "QPushButton:hover { background-color: #ff6d00; }")
+        self.atk_start_btn.clicked.connect(self._atk_start)
+        ctrl_row.addWidget(self.atk_start_btn)
+
+        self.atk_stop_btn = QPushButton("⏹ Stop Attack")
+        self.atk_stop_btn.setEnabled(False)
+        self.atk_stop_btn.setStyleSheet(
+            "QPushButton { background-color: #b71c1c; padding: 6px 18px; "
+            "font-weight: bold; color: white; } "
+            "QPushButton:hover { background-color: #d32f2f; }")
+        self.atk_stop_btn.clicked.connect(self._atk_stop)
+        ctrl_row.addWidget(self.atk_stop_btn)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        ctrl_row.addWidget(sep)
+
+        # Logger controls
+        self.atk_log_btn = QPushButton("📝 Start Logger")
+        self.atk_log_btn.clicked.connect(self._atk_toggle_logger)
+        ctrl_row.addWidget(self.atk_log_btn)
+
+        self.atk_log_label = QLabel("Logger: OFF")
+        self.atk_log_label.setStyleSheet("color: #888;")
+        ctrl_row.addWidget(self.atk_log_label)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        ctrl_row.addWidget(sep2)
+
+        # Dataset collection
+        self.atk_collect_btn = QPushButton("📊 Collect Dataset")
+        self.atk_collect_btn.setStyleSheet(
+            "QPushButton { background-color: #1565C0; padding: 6px 14px; "
+            "font-weight: bold; color: white; } "
+            "QPushButton:hover { background-color: #1E88E5; }")
+        self.atk_collect_btn.clicked.connect(self._atk_collect_dataset)
+        ctrl_row.addWidget(self.atk_collect_btn)
+
+        # Scenario builder
+        self.atk_scenario_btn = QPushButton("📋 Run Scenario…")
+        self.atk_scenario_btn.setStyleSheet(
+            "QPushButton { background-color: #6A1B9A; padding: 6px 14px; "
+            "font-weight: bold; color: white; } "
+            "QPushButton:hover { background-color: #8E24AA; }")
+        self.atk_scenario_btn.clicked.connect(self._atk_run_scenario)
+        ctrl_row.addWidget(self.atk_scenario_btn)
+
+        ctrl_row.addStretch()
+        atk_layout.addLayout(ctrl_row)
+
+        # ── Status / live info ──
+        status_group = QGroupBox("Attack Status")
+        status_layout = QGridLayout(status_group)
+        status_layout.setContentsMargins(10, 10, 10, 5)
+
+        status_layout.addWidget(QLabel("Status:"), 0, 0)
+        self.atk_status_label = QLabel("Idle")
+        self.atk_status_label.setStyleSheet("color: #4fc3f7; font-weight: bold;")
+        status_layout.addWidget(self.atk_status_label, 0, 1)
+
+        status_layout.addWidget(QLabel("Attack frames:"), 0, 2)
+        self.atk_frame_count_label = QLabel("0")
+        self.atk_frame_count_label.setStyleSheet("color: #ffb74d; font-weight: bold;")
+        status_layout.addWidget(self.atk_frame_count_label, 0, 3)
+
+        status_layout.addWidget(QLabel("Logger RX:"), 1, 0)
+        self.atk_log_rx_label = QLabel("0")
+        self.atk_log_rx_label.setStyleSheet("color: #81c784;")
+        status_layout.addWidget(self.atk_log_rx_label, 1, 1)
+
+        status_layout.addWidget(QLabel("Logger TX:"), 1, 2)
+        self.atk_log_tx_label = QLabel("0")
+        self.atk_log_tx_label.setStyleSheet("color: #ce93d8;")
+        status_layout.addWidget(self.atk_log_tx_label, 1, 3)
+
+        atk_layout.addWidget(status_group)
+
+        # Log counter refresh timer
+        self._atk_log_timer = QTimer()
+        self._atk_log_timer.timeout.connect(self._atk_update_log_counters)
+        self._atk_log_timer.start(500)
+
+        self.transmit_tabs.addTab(atk_widget, "⚠️ Attack Generator")
+
+    def _on_attack_type_changed(self, index: int):
+        """Show/hide parameter fields based on selected attack type."""
+        # 0=DoS, 1=Injection, 2=Fuzzing, 3=Replay, 4=Masquerade, 5=Suspension
+        is_injection = (index == 1)
+        is_fuzzing = (index == 2)
+        is_masquerade = (index == 4)
+        self.atk_payload_edit.setEnabled(is_injection)
+        self.atk_subtype_edit.setEnabled(is_injection or is_masquerade)
+        self.atk_id_mode_combo.setEnabled(is_fuzzing)
+        self.atk_drift_byte_edit.setEnabled(is_masquerade)
+        # DoS defaults
+        if index == 0:
+            self.atk_target_id_edit.setText("000")
+            self.atk_rate_edit.setText("0")
+        elif index == 1:
+            self.atk_target_id_edit.setText("18F81280")
+            self.atk_rate_edit.setText("100")
+        elif index == 2:
+            self.atk_rate_edit.setText("500")
+        elif index == 3:
+            self.atk_rate_edit.setText("10")   # record duration
+        elif index == 4:
+            self.atk_target_id_edit.setText("18F81280")
+            self.atk_rate_edit.setText("100")
+        elif index == 5:
+            self.atk_target_id_edit.setText("18F81280")
+
+    def _atk_parse_target_id(self) -> int:
+        """Parse and validate the target ID field as hex."""
+        text = self.atk_target_id_edit.text().strip()
+        if not text:
+            raise ValueError("Target ID is empty")
+        value = int(text, 16)
+        is_ext = len(text) > 3
+        max_id = 0x1FFFFFFF if is_ext else 0x7FF
+        if value < 0 or value > max_id:
+            raise ValueError(
+                f"CAN ID 0x{value:X} out of range (max 0x{max_id:X} for "
+                f"{'extended' if is_ext else 'standard'} frames)")
+        return value
+
+    def _atk_parse_payload(self) -> list:
+        """Parse and validate the payload hex string into a list of bytes."""
+        text = self.atk_payload_edit.text().strip()
+        if not text:
+            return [0] * 8
+        parts = text.replace(',', ' ').split()
+        if len(parts) > 8:
+            raise ValueError(f"Payload has {len(parts)} bytes (max 8)")
+        result = []
+        for b in parts:
+            val = int(b, 16)
+            if val < 0 or val > 0xFF:
+                raise ValueError(f"Byte value 0x{b} out of range (00-FF)")
+            result.append(val)
+        # Pad to 8 bytes
+        while len(result) < 8:
+            result.append(0)
+        return result
+
+    def _atk_start(self):
+        """Start the selected attack."""
+        if self._current_attack and self._current_attack.is_running:
+            QMessageBox.warning(self, "Attack Running",
+                                "Stop the current attack first.")
+            return
+
+        if not self.can_manager.is_connected:
+            QMessageBox.warning(self, "Not Connected",
+                                "Connect to a CAN bus first.")
+            return
+
+        attack_index = self.atk_type_combo.currentIndex()
+        try:
+            target_id = self._atk_parse_target_id()
+            duration = float(self.atk_duration_edit.text() or "0")
+            if duration < 0:
+                raise ValueError("Duration cannot be negative")
+            rate = int(self.atk_rate_edit.text() or "100")
+            if rate < 0:
+                raise ValueError("Rate cannot be negative")
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Parameters", str(e))
+            return
+
+        is_ext = len(self.atk_target_id_edit.text().strip()) > 3
+
+        attack = None
+        if attack_index == 0:  # DoS
+            attack = DoSAttack(
+                self.can_manager, self.labeled_logger,
+                arb_id=target_id, is_extended=is_ext,
+                duration_s=duration,
+                rate_limit=rate if rate > 0 else 0)
+        elif attack_index == 1:  # Injection
+            try:
+                payload = self._atk_parse_payload()
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Payload", str(e))
+                return
+            subtype = self.atk_subtype_edit.text().strip() or "forged"
+            attack = InjectionAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=target_id, is_extended=is_ext,
+                payload=payload, subtype_str=subtype,
+                cycle_ms=max(1, rate), duration_s=duration)
+        elif attack_index == 2:  # Fuzzing
+            id_mode = self.atk_id_mode_combo.currentText()
+            attack = FuzzAttack(
+                self.can_manager, self.labeled_logger,
+                id_mode=id_mode,
+                rate_limit=max(1, rate),
+                duration_s=duration)
+        elif attack_index == 3:  # Replay
+            attack = ReplayAttack(
+                self.can_manager, self.labeled_logger,
+                record_duration_s=float(rate),
+                replay_delay_s=2.0,
+                replay_count=1)
+        elif attack_index == 4:  # Masquerade
+            try:
+                drift_byte = int(self.atk_drift_byte_edit.text() or "4")
+                if drift_byte < 0 or drift_byte > 7:
+                    raise ValueError("Drift byte must be 0-7")
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Drift Byte", str(e))
+                return
+            attack = MasqueradeAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=target_id, is_extended=is_ext,
+                sim_engine=self.sim_engine,
+                drift_byte=drift_byte,
+                duration_s=duration)
+        elif attack_index == 5:  # Suspension
+            attack = SuspensionAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=target_id,
+                sim_engine=self.sim_engine,
+                duration_s=duration)
+
+        if attack:
+            attack.status_changed.connect(self._atk_on_status)
+            attack.frame_count_changed.connect(self._atk_on_frame_count)
+            attack.attack_finished.connect(self._atk_on_finished)
+            self._current_attack = attack
+            attack.start()
+            self.atk_start_btn.setEnabled(False)
+            self.atk_stop_btn.setEnabled(True)
+
+    def _atk_stop(self):
+        """Stop the current attack."""
+        if self._current_attack and self._current_attack.is_running:
+            self._current_attack.stop()
+        self._current_attack = None
+        self.atk_start_btn.setEnabled(True)
+        self.atk_stop_btn.setEnabled(False)
+
+    def _atk_on_status(self, text: str):
+        self.atk_status_label.setText(text)
+        self.status_label.setText(f"⚠️ {text}")
+
+    def _atk_on_frame_count(self, count: int):
+        self.atk_frame_count_label.setText(str(count))
+
+    def _atk_on_finished(self):
+        self.atk_start_btn.setEnabled(True)
+        self.atk_stop_btn.setEnabled(False)
+        self.atk_status_label.setText("Finished")
+
+    # --- Logger ---
+
+    def _atk_toggle_logger(self):
+        """Start or stop the labeled logger."""
+        if self.labeled_logger.is_running:
+            self.labeled_logger.stop()
+            self.atk_log_btn.setText("📝 Start Logger")
+            self.atk_log_label.setText("Logger: OFF")
+            self.atk_log_label.setStyleSheet("color: #888;")
+        else:
+            filepath, _ = QFileDialog.getSaveFileName(
+                self, "Save Labeled Log", "",
+                "CSV Files (*.csv);;All Files (*)")
+            if filepath:
+                self.labeled_logger.start(filepath)
+                self.atk_log_btn.setText("⏹ Stop Logger")
+                self.atk_log_label.setText(f"Logger: ON — {os.path.basename(filepath)}")
+                self.atk_log_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+
+    def _atk_update_log_counters(self):
+        """Refresh the logger frame counters."""
+        self.atk_log_rx_label.setText(str(self.labeled_logger.rx_count))
+        self.atk_log_tx_label.setText(str(self.labeled_logger.tx_count))
+
+    # --- Dataset Collection ---
+
+    def _atk_collect_dataset(self):
+        """Run the automated dataset collection sequence with configurable parameters."""
+        if self._dataset_collector.is_running:
+            self._dataset_collector.stop()
+            self.atk_collect_btn.setText("📊 Collect Dataset")
+            return
+
+        # Show configuration dialog
+        dlg = CollectionConfigDialog(self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+
+        cfg = dlg.get_config()
+
+        # Choose output file
+        from datetime import datetime as _dt
+        default_name = f"dataset_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Dataset CSV", default_name,
+            "CSV Files (*.csv);;All Files (*)")
+        if not filepath:
+            return
+
+        normal_dur = cfg['normal_duration_s']
+        rounds = cfg['rounds']
+        attacks_cfg = cfg['attacks']
+
+        # Map attack labels to factory callables
+        attack_factories = {
+            'dos': lambda: DoSAttack(
+                self.can_manager, self.labeled_logger,
+                arb_id=0x000, is_extended=False, duration_s=0),
+            'injection': lambda: InjectionAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=0x18F81280, is_extended=True,
+                payload=[0x03, 0x48, 0x00, 0x00, 0x64, 0x64, 0x00, 0x0A],
+                subtype_str="soc_spoof_full", cycle_ms=100, duration_s=0),
+            'fuzzing': lambda: FuzzAttack(
+                self.can_manager, self.labeled_logger,
+                id_mode="standard", rate_limit=500, duration_s=0),
+            'replay': lambda: ReplayAttack(
+                self.can_manager, self.labeled_logger,
+                record_duration_s=10, replay_delay_s=2),
+            'suspension': lambda: SuspensionAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=0x18F81280, sim_engine=self.sim_engine, duration_s=0),
+            'masquerade': lambda: MasqueradeAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=0x18F81280, is_extended=True,
+                sim_engine=self.sim_engine, drift_byte=4, duration_s=0),
+        }
+
+        # Build step sequence for N rounds
+        steps = []
+        for _round in range(rounds):
+            for key in ['dos', 'injection', 'fuzzing', 'replay', 'suspension', 'masquerade']:
+                acfg = attacks_cfg.get(key, {})
+                if not acfg.get('enabled', False):
+                    continue
+                steps.append(CollectionStep(phase="normal", duration_s=normal_dur))
+                steps.append(CollectionStep(
+                    phase=key,
+                    duration_s=acfg['duration'],
+                    attack_factory=attack_factories[key]))
+        # Final normal phase
+        steps.append(CollectionStep(phase="normal", duration_s=normal_dur))
+
+        # Store metadata for JSON sidecar
+        self._dataset_collector.set_metadata({
+            'config': cfg,
+            'sim_profile': self.sim_profile_combo.currentText()
+                           if self.sim_engine.is_running else None,
+        })
+
+        self._dataset_collector.set_steps(steps)
+        self._dataset_collector.start(filepath)
+        self.atk_collect_btn.setText("⏹ Stop Collection")
+
+    def _atk_on_collection_done(self, filepath: str):
+        self.atk_collect_btn.setText("📊 Collect Dataset")
+        self.atk_scenario_btn.setText("📋 Run Scenario…")
+        self.atk_status_label.setText(f"Dataset saved: {os.path.basename(filepath)}")
+        QMessageBox.information(self, "Dataset Complete",
+                                f"Dataset saved to:\n{filepath}\n\n"
+                                f"Frames logged: {self.labeled_logger.total_count}")
+
+    # --- Scenario Builder ---
+
+    def _atk_run_scenario(self):
+        """Open Scenario Builder dialog and run the defined sequence."""
+        if self._dataset_collector.is_running:
+            self._dataset_collector.stop()
+            self.atk_scenario_btn.setText("📋 Run Scenario…")
+            return
+
+        dlg = ScenarioBuilderDialog(self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+
+        raw_steps = dlg.get_steps_raw()
+        repeats = dlg.get_repeat()
+        if not raw_steps:
+            return
+
+        # Choose output CSV
+        from datetime import datetime as _dt
+        default_name = f"scenario_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Scenario Log", default_name,
+            "CSV Files (*.csv);;All Files (*)")
+        if not filepath:
+            return
+
+        # Map step types to CollectionStep objects
+        attack_factories = {
+            'dos': lambda: DoSAttack(
+                self.can_manager, self.labeled_logger,
+                arb_id=0x000, is_extended=False, duration_s=0),
+            'injection': lambda: InjectionAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=0x18F81280, is_extended=True,
+                payload=[0x03, 0x48, 0x00, 0x00, 0x64, 0x64, 0x00, 0x0A],
+                subtype_str="soc_spoof_full", cycle_ms=100, duration_s=0),
+            'fuzzing': lambda: FuzzAttack(
+                self.can_manager, self.labeled_logger,
+                id_mode="standard", rate_limit=500, duration_s=0),
+            'replay': lambda: ReplayAttack(
+                self.can_manager, self.labeled_logger,
+                record_duration_s=10, replay_delay_s=2),
+            'suspension': lambda: SuspensionAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=0x18F81280, sim_engine=self.sim_engine, duration_s=0),
+            'masquerade': lambda: MasqueradeAttack(
+                self.can_manager, self.labeled_logger,
+                target_id=0x18F81280, is_extended=True,
+                sim_engine=self.sim_engine, drift_byte=4, duration_s=0),
+        }
+
+        steps = []
+        for _ in range(repeats):
+            for raw in raw_steps:
+                stype = raw['type']
+                dur = raw['duration']
+                if stype in ('normal', 'pause'):
+                    steps.append(CollectionStep(phase="normal", duration_s=dur))
+                elif stype in attack_factories:
+                    steps.append(CollectionStep(
+                        phase=stype, duration_s=dur,
+                        attack_factory=attack_factories[stype]))
+
+        self._dataset_collector.set_metadata({
+            'scenario_steps': raw_steps,
+            'repeats': repeats,
+            'sim_profile': self.sim_profile_combo.currentText()
+                           if self.sim_engine.is_running else None,
+        })
+        self._dataset_collector.set_steps(steps)
+        self._dataset_collector.start(filepath)
+        self.atk_scenario_btn.setText("⏹ Stop Scenario")
+        self.atk_status_label.setText("Scenario running…")
 

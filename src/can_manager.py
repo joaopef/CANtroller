@@ -2,8 +2,11 @@
 CAN Manager - Handles PCAN connection and message handling
 """
 import can
+import logging
 import threading
 import time
+
+log = logging.getLogger('cantroller.can_manager')
 from collections import deque
 from typing import Callable, Optional, List, Dict
 from dataclasses import dataclass, field
@@ -77,6 +80,13 @@ class CANManager(QObject):
         
         # RX buffer for batch processing (thread-safe deque)
         self._rx_buffer: deque = deque(maxlen=10000)
+
+        # Secondary RX taps for attacks (list of deques)
+        self._rx_taps: List[deque] = []
+        self._rx_taps_lock = threading.Lock()
+        
+        # Labeled logger (optional, set by attack generator tab)
+        self._labeled_logger = None
         
         # Statistics
         self._rx_count = 0
@@ -127,12 +137,14 @@ class CANManager(QObject):
             self._receive_thread.start()
             
             status = f"Connected to {channel} @ {bitrate // 1000} kbit/s"
+            log.info(status)
             self.connection_changed.emit(True, status)
             self._emit_status()
             return True
             
         except Exception as e:
             error_msg = f"Connection failed: {str(e)}"
+            log.error(error_msg)
             self.error_occurred.emit(error_msg)
             self.connection_changed.emit(False, error_msg)
             return False
@@ -150,8 +162,8 @@ class CANManager(QObject):
             self.bus = None
         self.connection_changed.emit(False, "Disconnected")
     
-    def send_message(self, arbitration_id: int, data: List[int], is_extended: bool = True) -> bool:
-        """Send a CAN message"""
+    def send_message(self, arbitration_id: int, data: List[int], is_extended: bool = True, silent: bool = False) -> bool:
+        """Send a CAN message. If silent=True, errors are counted but no signal is emitted."""
         if not self.bus:
             return False
             
@@ -164,10 +176,15 @@ class CANManager(QObject):
             self.bus.send(msg)
             self._tx_count += 1
             self.message_sent.emit(msg)
+            # Log TX to labeled logger if active
+            if self._labeled_logger and self._labeled_logger.is_running:
+                self._labeled_logger.log_tx(arbitration_id, data, is_extended)
             return True
         except Exception as e:
             self._error_count += 1
-            self.error_occurred.emit(f"Send failed: {str(e)}")
+            log.debug('Send failed (id=0x%X): %s', arbitration_id, e)
+            if not silent:
+                self.error_occurred.emit(f"Send failed: {str(e)}")
             return False
     
     def drain_rx_buffer(self) -> list:
@@ -175,6 +192,21 @@ class CANManager(QObject):
         msgs = list(self._rx_buffer)
         self._rx_buffer.clear()
         return msgs
+
+    def create_rx_tap(self, maxlen: int = 10000) -> deque:
+        """Create a secondary RX tap that receives copies of all incoming messages."""
+        tap = deque(maxlen=maxlen)
+        with self._rx_taps_lock:
+            self._rx_taps.append(tap)
+        return tap
+
+    def remove_rx_tap(self, tap: deque):
+        """Remove a previously created RX tap."""
+        with self._rx_taps_lock:
+            try:
+                self._rx_taps.remove(tap)
+            except ValueError:
+                pass
     
     def _emit_status(self):
         """Emit current status"""
@@ -220,7 +252,13 @@ class CANManager(QObject):
         self._transmit_messages.append(msg)
         if not msg.is_paused and self.is_connected:
             self._start_transmit_timer(msg)
-    
+
+    def insert_transmit_message(self, index: int, msg: TransmitMessage):
+        """Insert a periodic transmit message at a specific position."""
+        self._transmit_messages.insert(index, msg)
+        if not msg.is_paused and self.is_connected:
+            self._start_transmit_timer(msg)
+
     def remove_transmit_message(self, index: int):
         """Remove a transmit message by index"""
         if 0 <= index < len(self._transmit_messages):
@@ -301,6 +339,15 @@ class CANManager(QObject):
                     self._rx_count += 1
                     # Buffer message for batch GUI processing
                     self._rx_buffer.append(msg)
+
+                    # Copy to any active RX taps (attacks)
+                    with self._rx_taps_lock:
+                        for tap in self._rx_taps:
+                            tap.append(msg)
+                    
+                    # Log RX to labeled logger if active
+                    if self._labeled_logger and self._labeled_logger.is_running:
+                        self._labeled_logger.log_rx(msg)
                     
                     # Check for auto-response
                     if self._response_mode_enabled:
@@ -309,6 +356,7 @@ class CANManager(QObject):
             except Exception as e:
                 if self._running:
                     self._error_count += 1
+                    log.warning('Receive error: %s', e)
                     self.error_occurred.emit(f"Receive error: {str(e)}")
     
     def _check_and_respond(self, received_msg: can.Message):
@@ -319,8 +367,12 @@ class CANManager(QObject):
                 
             if received_msg.arbitration_id == rule.trigger_id:
                 if rule.delay_ms > 0:
-                    # Schedule response on main thread without blocking RX loop
-                    QTimer.singleShot(rule.delay_ms, lambda r=rule: self._delayed_response.emit(r))
+                    # Schedule response using a thread timer (safe from any thread)
+                    t = threading.Timer(
+                        rule.delay_ms / 1000.0,
+                        lambda r=rule: self._delayed_response.emit(r))
+                    t.daemon = True
+                    t.start()
                 else:
                     self._send_response(rule)
     

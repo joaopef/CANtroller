@@ -3,11 +3,14 @@ Simulator - Fake BMS/MCU simulation for CANtroller
 Generates synthetic trip profiles and replays them as CAN messages.
 """
 import csv
+import logging
 import math
 import os
 import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable
+
+log = logging.getLogger('cantroller.simulator')
 
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 
@@ -104,6 +107,141 @@ class TripProfileGenerator:
         2: {'name': 'Normal',  'gear': 2, 'top_speed': 75,  'power_pct': 0.50, 'regen_pct': 0.20},
         3: {'name': 'Sport',   'gear': 3, 'top_speed': 100, 'power_pct': 1.00, 'regen_pct': 0.0},
     }
+
+    # === Vehicle Dynamics (Fulgora EV motorcycle) ===
+    VEHICLE_MASS_KG = 180.0         # Motorcycle curb weight
+    RIDER_MASS_KG = 75.0            # Average rider
+    TOTAL_MASS_KG = 255.0           # Vehicle + rider
+    CRR = 0.015                     # Rolling resistance (motorcycle tire on asphalt)
+    CDA = 0.4                       # Drag area CdA in m² (rider + fairing)
+    AIR_DENSITY = 1.225             # kg/m³ at sea level
+    GRAVITY = 9.81                  # m/s²
+    MOTOR_EFFICIENCY = 0.85         # Motor efficiency
+    DRIVETRAIN_EFFICIENCY = 0.95    # Single-speed reduction
+    REGEN_EFFICIENCY = 0.60         # Regenerative braking recovery
+    IDLE_DRAW_A = 1.0               # Electronics idle current
+
+    # === WMTC Speed Traces ===
+    # UN ECE GTR No. 2, Class 1-2 (v_max ≤ 100 km/h)
+    # Breakpoints: (time_s, speed_kmh) — linear interpolation between points
+    # Part 1: Urban cycle, 600s, max ~50 km/h, avg ~25 km/h
+    _WMTC_PART1_BREAKPOINTS = [
+        # Idle
+        (0, 0), (20, 0),
+        # Micro-trip 1: gentle urban acceleration
+        (21, 0), (35, 25), (50, 30), (60, 28), (72, 0),
+        (85, 0),
+        # Micro-trip 2: moderate urban
+        (86, 0), (100, 32), (110, 36), (125, 34), (135, 38),
+        (148, 30), (158, 0), (170, 0),
+        # Micro-trip 3: higher speed urban (peak ~50 km/h)
+        (171, 0), (185, 35), (200, 48), (220, 50), (240, 46),
+        (255, 50), (270, 40), (282, 0), (295, 0),
+        # Micro-trip 4: varied urban with undulations
+        (296, 0), (310, 30), (325, 42), (340, 45), (355, 40),
+        (370, 48), (385, 35), (395, 0), (410, 0),
+        # Micro-trip 5: moderate cruise
+        (411, 0), (425, 38), (440, 45), (460, 50), (480, 48),
+        (495, 42), (505, 0), (520, 0),
+        # Micro-trip 6: final urban segment
+        (521, 0), (535, 30), (548, 40), (558, 38), (568, 42),
+        (578, 30), (590, 15), (598, 0), (600, 0),
+    ]
+
+    # Part 2: Extra-urban/rural cycle, 600s, max ~95 km/h
+    # Used when generating the extended WMTC Part 1+2 profile
+    _WMTC_PART2_BREAKPOINTS = [
+        # Start from stop
+        (0, 0), (5, 0),
+        # Suburban acceleration
+        (6, 0), (25, 55), (50, 60), (75, 65), (100, 60),
+        # Brief deceleration zone
+        (115, 50), (125, 55),
+        # Highway entry ramp
+        (140, 70), (165, 80), (185, 85), (210, 90), (235, 95),
+        # High-speed cruise with variation
+        (260, 90), (280, 95), (300, 92),
+        # Slow section (construction/traffic)
+        (320, 80), (340, 70), (355, 55), (370, 60),
+        # Return to high speed
+        (390, 75), (415, 90), (440, 95), (465, 88),
+        # Deceleration to suburban
+        (485, 70), (500, 55), (520, 45),
+        # Low speed finish
+        (540, 30), (555, 20), (568, 0), (580, 0),
+        # Short final burst
+        (581, 0), (590, 25), (598, 15), (600, 0),
+    ]
+
+    @staticmethod
+    def _speed_to_gear(speed_kmh: float) -> int:
+        """Dynamic gear (driving mode) selection based on current speed."""
+        if speed_kmh < 1:
+            return 0   # Park / Neutral
+        elif speed_kmh <= 45:
+            return 1   # Eco
+        elif speed_kmh <= 75:
+            return 2   # Normal
+        else:
+            return 3   # Sport
+
+    @classmethod
+    def _interpolate_speed_trace(cls, breakpoints: list, time_s: float) -> float:
+        """Linearly interpolate speed from a breakpoint list at a given time."""
+        if time_s <= breakpoints[0][0]:
+            return breakpoints[0][1]
+        if time_s >= breakpoints[-1][0]:
+            return breakpoints[-1][1]
+        for i in range(len(breakpoints) - 1):
+            t0, v0 = breakpoints[i]
+            t1, v1 = breakpoints[i + 1]
+            if t0 <= time_s <= t1:
+                if t1 == t0:
+                    return v0
+                frac = (time_s - t0) / (t1 - t0)
+                return v0 + frac * (v1 - v0)
+        return 0.0
+
+    @classmethod
+    def _speed_to_current(cls, speed_kmh: float, prev_speed_kmh: float,
+                          dt_s: float, voltage_V: float) -> float:
+        """
+        Vehicle dynamics model: convert speed + acceleration into battery current.
+
+        Uses rolling resistance, aerodynamic drag, and inertial force to compute
+        mechanical power, then converts to electrical current via motor/drivetrain
+        efficiency. Accounts for regenerative braking during deceleration.
+        """
+        v = speed_kmh / 3.6      # m/s
+        v_prev = prev_speed_kmh / 3.6
+        a = (v - v_prev) / dt_s if dt_s > 0 else 0.0
+
+        # Force components
+        F_inertia = cls.TOTAL_MASS_KG * a
+        F_rolling = cls.CRR * cls.TOTAL_MASS_KG * cls.GRAVITY if v > 0.1 else 0.0
+        F_aero = 0.5 * cls.AIR_DENSITY * cls.CDA * v * v
+        F_total = F_inertia + F_rolling + F_aero
+
+        P_mech = F_total * v  # Mechanical power in Watts
+
+        if P_mech >= 0:
+            # Driving: discharge
+            eta = cls.MOTOR_EFFICIENCY * cls.DRIVETRAIN_EFFICIENCY
+            P_elec = P_mech / eta if eta > 0 else 0.0
+            current = P_elec / voltage_V if voltage_V > 0 else 0.0
+        else:
+            # Braking: regenerative charge (negative current)
+            eta = cls.MOTOR_EFFICIENCY * cls.DRIVETRAIN_EFFICIENCY * cls.REGEN_EFFICIENCY
+            P_regen = P_mech * eta  # Negative watts recovered
+            current = P_regen / voltage_V if voltage_V > 0 else 0.0
+
+        # Idle electronics draw when stationary
+        if speed_kmh < 1 and current < cls.IDLE_DRAW_A:
+            current = cls.IDLE_DRAW_A
+
+        # Clamp to pack limits
+        current = max(-cls.MAX_CONTINUOUS_A * 0.3, min(current, cls.MAX_CONTINUOUS_A))
+        return current
 
     @classmethod
     def _voltage_from_soc(cls, soc_pct: float) -> float:
@@ -400,6 +538,103 @@ class TripProfileGenerator:
         return profile
 
     @classmethod
+    def generate_wmtc_class1(cls, parts: list = None,
+                              start_soc: float = 90.0,
+                              soh: float = 95.0,
+                              fc_cycles: int = 120,
+                              start_odometer: int = 1250) -> TripProfile:
+        """
+        WMTC Class 1-2 standardized motorcycle driving cycle.
+        UN ECE GTR No. 2 — for vehicles with v_max ≤ 100 km/h.
+
+        Args:
+            parts: Which parts to include. Default [1] for Part 1 only (urban, 600s).
+                   Use [1, 2] for Part 1 + Part 2 (urban + extra-urban, 1200s).
+            start_soc: Initial state of charge (%).
+            soh: State of health (%).
+            fc_cycles: Full charge cycle count.
+            start_odometer: Odometer reading (km).
+
+        The speed trace is deterministic (same every run), making this profile
+        ideal for reproducible dataset collection and benchmarking.
+        Gears are assigned dynamically based on speed (Eco/Normal/Sport).
+        Current is computed from vehicle dynamics (mass, drag, rolling resistance).
+        """
+        if parts is None:
+            parts = [1]
+
+        # Build the combined speed trace breakpoints
+        breakpoints = []
+        if 1 in parts:
+            breakpoints.extend(cls._WMTC_PART1_BREAKPOINTS)
+        if 2 in parts:
+            offset = breakpoints[-1][0] if breakpoints else 0.0
+            for t, v in cls._WMTC_PART2_BREAKPOINTS:
+                breakpoints.append((t + offset, v))
+
+        total_seconds = int(breakpoints[-1][0])
+        parts_str = '+'.join(str(p) for p in sorted(parts))
+        profile = TripProfile(
+            name=f"WMTC Class 1-2 Part {parts_str}",
+            description=f"WMTC standardized motorcycle cycle, Part {parts_str}, "
+                        f"{total_seconds}s, deterministic speed trace",
+            duration_min=total_seconds / 60.0
+        )
+
+        step_s = 1.0
+        soc = start_soc
+        trip_km = 0.0
+        prev_speed = 0.0
+
+        for t in range(0, total_seconds + 1):
+            speed = cls._interpolate_speed_trace(breakpoints, float(t))
+            speed_int = max(0, int(round(speed)))
+            gear = cls._speed_to_gear(speed)
+            voltage = cls._voltage_from_soc(soc)
+
+            # Vehicle dynamics current model
+            current = cls._speed_to_current(speed, prev_speed, step_s, voltage)
+
+            # SOC change
+            energy_wh = current * cls.PACK_VOLTAGE_NOMINAL * (step_s / 3600.0)
+            total_energy_wh = cls.PACK_CAPACITY_AH * cls.PACK_VOLTAGE_NOMINAL
+            soc -= (energy_wh / total_energy_wh) * 100.0
+            soc = max(0, min(100, soc))
+
+            trip_km += speed_int * (step_s / 3600.0)
+            voltage = cls._voltage_from_soc(soc)
+
+            # Temperature model
+            if t == 0:
+                temp_C = cls.AMBIENT_TEMP_C
+            else:
+                prev_temp = profile.data_points[-1].temperature_C
+                heat_gain = cls.THERMAL_RESISTANCE * abs(current) * step_s
+                heat_loss = 0.002 * (prev_temp - cls.AMBIENT_TEMP_C) * step_s
+                temp_C = prev_temp + heat_gain - heat_loss
+
+            profile.data_points.append(TripDataPoint(
+                time_s=float(t),
+                voltage_V=voltage,
+                current_A=round(current, 2),
+                soc_pct=round(soc, 1),
+                soh_pct=soh,
+                fc_cycles=fc_cycles,
+                speed_kmh=speed_int,
+                total_mileage_km=start_odometer + int(trip_km),
+                current_mileage_km=round(trip_km, 1),
+                gear=gear,
+                temperature_C=round(temp_C, 1)
+            ))
+
+            prev_speed = speed
+            if soc <= 0:
+                break
+
+        cls._apply_pybamm_if_available(profile, start_soc / 100.0)
+        return profile
+
+    @classmethod
     def _apply_pybamm_if_available(cls, profile, initial_soc_frac: float):
         """
         If PyBaMM is available, re-run the drive cycle through the physics model
@@ -440,6 +675,18 @@ class TripProfileGenerator:
     def get_available_profiles(cls) -> List[dict]:
         """List of available profile generators with metadata"""
         return [
+            {
+                "name": "WMTC Part 1 — Urban (10 min)",
+                "generator": cls.generate_wmtc_class1,
+                "kwargs": {"parts": [1]},
+                "description": "WMTC Class 1-2 Part 1: standardized urban cycle, 600s, deterministic"
+            },
+            {
+                "name": "WMTC Part 1+2 — Urban+Rural (20 min)",
+                "generator": cls.generate_wmtc_class1,
+                "kwargs": {"parts": [1, 2]},
+                "description": "WMTC Class 1-2 Part 1+2: urban + extra-urban, 1200s, deterministic"
+            },
             {
                 "name": "City Trip (30 min)",
                 "generator": cls.generate_city_trip,
@@ -755,6 +1002,7 @@ class SimulationEngine(QObject):
         self._is_paused: bool = False
         self._playback_speed: float = 1.0
         self._send_interval_ms: int = 250  # Base interval between sends
+        self._suppressed_ids: set = set()  # CAN IDs suppressed by attack generator
 
     @property
     def is_running(self) -> bool:
@@ -857,6 +1105,7 @@ class SimulationEngine(QObject):
             self._is_running = False
             if self._timer:
                 self._timer.stop()
+                self._timer = None
             self.progress_changed.emit(100)
             self.simulation_finished.emit()
             self.status_message.emit(f"✓ Simulation complete: {self._profile.name}")
@@ -864,17 +1113,20 @@ class SimulationEngine(QObject):
 
         dp = self._profile.data_points[self._current_index]
 
-        # Encode and send BMS frame
-        bms_data = encode_bms_frame(dp)
-        self._can_manager.send_message(BMS_CAN_ID, bms_data, is_extended=True)
+        # Encode and send BMS frame (unless suppressed by attack generator)
+        if BMS_CAN_ID not in self._suppressed_ids:
+            bms_data = encode_bms_frame(dp)
+            self._can_manager.send_message(BMS_CAN_ID, bms_data, is_extended=True, silent=True)
 
         # Encode and send MCU frame
-        mcu_data = encode_mcu_frame(dp)
-        self._can_manager.send_message(MCU_CAN_ID, mcu_data, is_extended=True)
+        if MCU_CAN_ID not in self._suppressed_ids:
+            mcu_data = encode_mcu_frame(dp)
+            self._can_manager.send_message(MCU_CAN_ID, mcu_data, is_extended=True, silent=True)
 
         # Encode and send BMS Temperature frame
-        bms_temp_data = encode_bms_temp_frame(dp)
-        self._can_manager.send_message(BMS_TEMP_CAN_ID, bms_temp_data, is_extended=True)
+        if BMS_TEMP_CAN_ID not in self._suppressed_ids:
+            bms_temp_data = encode_bms_temp_frame(dp)
+            self._can_manager.send_message(BMS_TEMP_CAN_ID, bms_temp_data, is_extended=True, silent=True)
 
         # Calculate progress
         progress = int((self._current_index / len(self._profile.data_points)) * 100)
@@ -908,3 +1160,21 @@ class SimulationEngine(QObject):
         # We accumulate and step when >= 1
         steps = max(1, int(self._playback_speed * self._send_interval_ms / 1000.0))
         self._current_index += steps
+
+    # === Fault Injection Integration ===
+
+    def suppress_id(self, can_id: int):
+        """Suppress a CAN ID from being sent by the simulator (used by attack generator)."""
+        self._suppressed_ids.add(can_id)
+
+    def unsuppress_id(self, can_id: int):
+        """Resume sending a previously suppressed CAN ID."""
+        self._suppressed_ids.discard(can_id)
+
+    def clear_suppressions(self):
+        """Remove all CAN ID suppressions."""
+        self._suppressed_ids.clear()
+
+    @property
+    def suppressed_ids(self) -> set:
+        return self._suppressed_ids.copy()

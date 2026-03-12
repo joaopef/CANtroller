@@ -2,11 +2,35 @@
 CANtroller - Intelligent CAN Bus Tool
 A simple CAN bus viewer with automatic response capabilities
 """
+import logging
+import os
 import sys
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFont
 
 from main_window import MainWindow
+
+
+def setup_logging():
+    """Configure application-wide logging."""
+    if getattr(sys, 'frozen', False):
+        log_dir = os.path.dirname(sys.executable)
+    else:
+        log_dir = os.path.dirname(__file__)
+    log_file = os.path.join(log_dir, 'cantroller.log')
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    # Silence noisy third-party loggers
+    logging.getLogger('can').setLevel(logging.WARNING)
+    logging.getLogger('pybamm').setLevel(logging.WARNING)
 
 
 # Dark theme stylesheet
@@ -191,6 +215,10 @@ QSplitter::handle:vertical {
 
 
 def main():
+    setup_logging()
+    log = logging.getLogger('cantroller')
+    log.info('CANtroller starting…')
+
     app = QApplication(sys.argv)
     
     # Apply dark theme
