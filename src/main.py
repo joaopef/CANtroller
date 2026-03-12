@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIcon
 
 from main_window import MainWindow
 
@@ -223,6 +223,14 @@ def main():
     
     # Apply dark theme
     app.setStyleSheet(DARK_STYLE)
+    
+    # Set application icon (taskbar + window title bar)
+    if getattr(sys, 'frozen', False):
+        icon_path = os.path.join(sys._MEIPASS, 'icon.png')
+    else:
+        icon_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'icon.png')
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     
     # Set application font
     font = QFont("Segoe UI", 10)

@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\main.py'],
     pathex=['src'],
     binaries=[],
-    datas=[],
+    datas=[('assets/icon.png', '.')],
     hiddenimports=[
         'can.interfaces.pcan',
         'can.interfaces.virtual',
@@ -50,4 +50,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/icon.ico',
 )
